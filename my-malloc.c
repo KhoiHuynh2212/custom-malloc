@@ -1,31 +1,50 @@
 #include<unistd.h>
 #include<stdio.h> 
 #include<assert.h>
+#include "list.h"
 
-typedef struct block_t {
+#define HEAP_SIZE        4096
+#define ALIGN            _Alignof(max_align_t)
+#define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
+
+
+typedef struct Block {
     size_t size;
-    struct block_t * next;
-    struct block_t * prev;  
-} block_t;
+    int free;
+    list lst; 
+} Block; 
 
-void* my_malloc(size_t size) {
-    void*   ptr = sbrk(0);
+static Block head = {
+    .size = 0,
+    .free = 1,
+    .lst = {&head.lst, &head.lst}
+};
 
-    void* request = sbrk(size);
-
-    if(request == (void*) -1) {
-        return NULL;
-    } else {
-        assert(ptr == request);
-        return ptr;
+void heap_init() {
+    void* start = sbrk(HEAP_SIZE);
+    if(start == (void*) -1) {
+        return;
     }
+    Block* first = (Block*) start;
+    first->size = HEAP_SIZE - sizeof(Block);
+    first->free = 1;
+    list_add_after(&head.lst, &first->lst);
+}
 
+Block* find_suitable_block(size_t requestSize) {
+    list* curr = head.lst.next;
+    while(curr != &head.lst) {
+        Block* blk = list_entry(curr, Block, lst);
+        if(blk->size >= requestSize) {
+            return blk;
+        }
+        curr = curr->next;
+    }
+    return NULL;
 }
 int main() {
-
-    int * m = my_malloc(sizeof(int));
-    * m = 50;
-
-    printf("Value is %d\n", *m);
+    printf("Current program break: %10p\n", sbrk(0));
+    heap_init(); 
+    printf("After init heap: %10p\n", sbrk(0));
     return 0;
 }
