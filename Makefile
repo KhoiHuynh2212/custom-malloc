@@ -1,13 +1,18 @@
-CC      = gcc
-CFLAGS  = -Wall -Wextra
-DEBUG   = -g
-RELEASE = -O2
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c11
+ASAN = -fsanitize=address,undefined -g
 
-ASAN_FLAGS = -fsanitize=address,undefined -g
+all:
+	$(CC) $(CFLAGS) -o my-malloc my-malloc.c
 
-ASAN_RUN   = ASAN_OPTIONS=detect_leaks=0 
+asan:
+	$(CC) $(CFLAGS) $(ASAN) -o my-malloc my-malloc.c
 
-ma: 
-	$(CC) $(CFLAGS) $(ASAN_FLAGS) -o my-malloc my-malloc.c
-	@echo "== RUNNING MALLOC =="
+run: all
 	./my-malloc
+
+clean:
+	rm -f my-malloc
+
+valgrind: all
+	valgrind ./my-malloc
