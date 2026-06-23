@@ -16,3 +16,6 @@ clean:
 
 valgrind: all
 	valgrind ./my-malloc
+
+gdb:
+	gdb ./my-malloc
