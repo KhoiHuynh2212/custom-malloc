@@ -1,0 +1,17 @@
+# IDE
+.idea/
+
+# CLion/CMake
+cmake-build-*/
+
+# Binary
+my-malloc
+
+# Object files
+*.o
+
+# Debug symbols
+*.dSYM
+
+# Temporary
+*.swp

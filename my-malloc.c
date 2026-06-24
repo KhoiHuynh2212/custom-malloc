@@ -4,10 +4,8 @@
 #include<assert.h>
 #include "list.h"
 
-#define HEAP_SIZE        4096
 #define ALIGN            _Alignof(max_align_t)
 #define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
-
 #define FREE 1
 #define ALLOCATED 0
 
@@ -17,13 +15,18 @@ typedef struct Block {
     list list; 
 } Block; 
 
+_Static_assert(
+    sizeof(Block) % ALIGN  == 0, "Block header must be aligned"
+);
+
 const size_t BLOCK_SIZE = sizeof(Block);
+#define HEAP_SIZE        128 * 1024 + BLOCK_SIZE
 
 static Block head = {
     .size = 0,
     .free = ALLOCATED,
-    .list = LIST_INIT(head)
-};
+    .list = LIST_INIT(head.list)
+}; // sentinel header block
 
 void heap_init() {
     void* start = sbrk(HEAP_SIZE);
@@ -83,7 +86,7 @@ void * my_malloc(size_t size) {
 
     if(size <= 0) return NULL; 
 
-    size_t align = ALIGN_UP(size);
+    size_t align = ALIGN_UP(size); // find align block
 
     Block* block = find_suitable_block(align);
 
@@ -94,11 +97,11 @@ void * my_malloc(size_t size) {
             return NULL;
         }
         return block + 1;
-    } else {
-        if(block->size >= align +  BLOCK_SIZE + ALIGN) {
-            block = split(block, align);
-            return block + 1;
-        }
+    }
+
+    if(block->size >= align +  BLOCK_SIZE + ALIGN) {
+        block = split(block, align);
+        return block + 1;
     }
     list_unlink(&block->list); // only unlink if it came from free list
     block->free = ALLOCATED; 
@@ -126,12 +129,13 @@ void my_free(void* ptr) {
     Block* header = (Block* )ptr - 1;
     header->free = FREE; 
     list_add_after(&head.list, &header->list);
-    coalesce(&header);
+    coalesce(header);
 }
 int main() {
 
     heap_init();
-    
+
+    printf("Size of Block header %zu\n", BLOCK_SIZE);
     int * y = my_malloc(sizeof(int));
     printf("After allocated y: %zu blocks\n", list_length(&head.list));
     int * x = my_malloc(sizeof(int));
