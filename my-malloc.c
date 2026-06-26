@@ -1,50 +1,71 @@
 #define _GNU_SOURCE
-#include<unistd.h>
-#include<stdio.h> 
-#include<assert.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <assert.h>
 #include "list.h"
 
-#define ALIGN            _Alignof(max_align_t)
+#define ALIGN _Alignof(max_align_t)
 #define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
+#define MIN_FREE_BLOCK (HEADER_SIZE + sizeof(size_t) + ALIGN)
 #define FREE 1
 #define ALLOCATED 0
 
-typedef struct Block {
-    size_t size;
+typedef struct Block
+{
+    size_t payload;
     int free;
-    list list; 
-} Block; 
+    list list;
+} Block;
 
-_Static_assert(
-    sizeof(Block) % ALIGN  == 0, "Block header must be aligned"
-);
+const size_t HEADER_SIZE = sizeof(Block);
+#define HEAP_SIZE 128 * 1024 + HEADER_SIZE
 
-const size_t BLOCK_SIZE = sizeof(Block);
-#define HEAP_SIZE        128 * 1024 + BLOCK_SIZE
+#define BLOCK_NEXT_HEADER(curr, payload) \
+    ((Block *)((char *)((curr) + 1) + (payload) + sizeof(size_t)))
+
+#define BLOCK_PREV_HEADER(curr, prev_size) \
+    ((Block *)((char *)curr - sizeof(size_t) - prev_size - HEADER_SIZE))
+
+// set function prototypes
+void set_footer(Block *block);
 
 static Block head = {
-    .size = 0,
+    .payload = 0,
     .free = ALLOCATED,
-    .list = LIST_INIT(head.list)
-}; // sentinel header block
+    .list = LIST_INIT(head.list)}; // sentinel header block
 
-void heap_init() {
-    void* start = sbrk(HEAP_SIZE);
-    if(start == (void*) -1) {
+static void *heap_start;
+static void *heap_end;
+void heap_init()
+{
+
+    void *start = sbrk(HEAP_SIZE);
+
+    heap_start = start;
+    heap_end = start + HEAP_SIZE;
+    if (start == (void *)-1)
+    {
         return;
     }
-    Block* first = (Block*) start;
-    first->size = HEAP_SIZE - BLOCK_SIZE;
+    Block *first = (Block *)start;
+
+    printf("The heap is start at %p\n", start);
+    first->payload = HEAP_SIZE - HEADER_SIZE - sizeof(size_t);
     first->free = FREE;
+    set_footer(first);
     list_init(&first->list);
     list_add_after(&head.list, &first->list);
+
 }
 
-Block* find_suitable_block(size_t requestSize) {
-    list* curr = head.list.next;
-    while(curr != &head.list) {
-        Block* block = list_entry(curr, Block, list);
-        if(block->size >= requestSize) {
+Block *find_suitable_block(size_t requestSize)
+{
+    list *curr = head.list.next;
+    while (curr != &head.list)
+    {
+        Block *block = list_entry(curr, Block, list);
+        if (block->payload >= requestSize)
+        {
             return block;
         }
         curr = curr->next;
@@ -52,106 +73,162 @@ Block* find_suitable_block(size_t requestSize) {
     return NULL;
 }
 
-// request OS to give more memory if there is no free block 
-Block* requestBlock(size_t size) {
-    
-    Block* newBlock = NULL;
-    void* request = sbrk(BLOCK_SIZE + size);
-    if(request == (void*) -1) {
-        return NULL;
-    } 
+// request OS to give more memory if there is no free block
+Block *requestBlock(size_t size)
+{
 
-    newBlock = (Block*) request;
+    Block *newBlock = NULL;
+    void *request = sbrk(HEADER_SIZE + size);
+    if (request == (void *)-1)
+    {
+        return NULL;
+    }
+
+    newBlock = (Block *)request;
     newBlock->free = ALLOCATED;
-    newBlock->size = size;
+    newBlock->payload = size;
+    set_footer(newBlock);
     list_init(&newBlock->list);
+
+    heap_end = (char*)request + HEADER_SIZE + size;
     return newBlock;
 }
 
-Block* split(Block* block, size_t totalAllocSize) {
-    Block* remainder = (Block*)((char*)(block + 1) + totalAllocSize);
-    remainder->size = block->size - totalAllocSize - BLOCK_SIZE;
+Block *split(Block *block, size_t requestPayload)
+{
+    Block *remainder = BLOCK_NEXT_HEADER(block, requestPayload);
+    remainder->payload = block->payload - requestPayload - HEADER_SIZE;
     remainder->free = FREE;
+    set_footer(remainder);
     list_init(&remainder->list);
     list_add_after(&head.list, &remainder->list);
 
     // block get trimmed and given to the caller
-    block->size = totalAllocSize;
+    block->payload = requestPayload;
     block->free = ALLOCATED;
-    list_unlink(&block->list); 
+    set_footer(block);
+    list_unlink(&block->list);
 
     return block;
 }
-void * my_malloc(size_t size) {
 
-    if(size <= 0) return NULL; 
+void coalesce(Block *curr)
+{
 
-    size_t align = ALIGN_UP(size); // find align block
+    Block *next_block = BLOCK_NEXT_HEADER(curr, curr->payload);
 
-    Block* block = find_suitable_block(align);
+    if ((char*) next_block != (char*) heap_end && next_block->free == FREE)
+    {
+        curr->payload += HEADER_SIZE + next_block->payload + sizeof(size_t);
+        set_footer(curr);
+        list_unlink(&next_block->list);
+    }
 
-    if(block == NULL) {
-        block = requestBlock(align);
+    size_t *footer = (size_t *)((char *)curr - sizeof(size_t));
 
-        if(block == NULL) {
+    if ((char *)footer >= (char *)heap_start)
+    {
+        Block *prev_block = BLOCK_PREV_HEADER(curr, (*footer));
+
+        if ((char *)prev_block >= (char *)heap_start && prev_block->free == FREE)
+        {
+            prev_block->payload += HEADER_SIZE + sizeof(size_t) + curr->payload;
+            set_footer(prev_block);
+            list_unlink(&curr->list);
+        }
+    }
+}
+
+// set payload footer
+void set_footer(Block *block)
+{
+    size_t *footer =
+        (size_t *)((char *)(block + 1) + block->payload) - 1;
+
+    *footer = block->payload;
+}
+void *my_malloc(size_t size)
+{
+
+    if (size == 0)
+        return NULL;
+
+    size_t requestPayload = ALIGN_UP(size); // find align block
+    // size_t total = BLOCK_SIZE + payload + sizeof(size_t);
+    Block *block = find_suitable_block(requestPayload);
+
+    if (block == NULL)
+    {
+        block = requestBlock(requestPayload);
+
+        if (block == NULL)
+        {
             return NULL;
         }
+        printf("Size of allocated block after requested new block %zu\n", block->payload);
+        printf("-----------------------------------\n");
         return block + 1;
     }
 
-    if(block->size >= align +  BLOCK_SIZE + ALIGN) {
-        block = split(block, align);
+    if (block->payload >= requestPayload + MIN_FREE_BLOCK)
+    {
+        block = split(block, requestPayload);
+        printf("Size of allocated block after spliting %zu\n", block->payload);
+        printf("-----------------------------------\n");
         return block + 1;
     }
     list_unlink(&block->list); // only unlink if it came from free list
-    block->free = ALLOCATED; 
+    block->free = ALLOCATED;
+    printf("Size of allocated block if found %zu\n", block->payload);
+    printf("-----------------------------------\n");
     return block + 1;
-} 
-
-void coalesce(Block* block) {
-    // merge with next if free
-    Block* next = list_entry(block->list.next, Block, list);
-    if(next != &head && next->free == FREE ) {
-        block->size += BLOCK_SIZE + next->size;
-        list_unlink(&next->list);
-    } 
-
-    // merge with prev if free
-    Block* prev = list_entry(block->list.prev, Block, list);
-    if(prev != &head && prev->free == FREE) {
-        block->size += BLOCK_SIZE + prev->size;
-        list_unlink(&block->list);
-        block = prev;
-    }
 }
-void my_free(void* ptr) {
-    if (ptr == NULL) return;
-    Block* header = (Block* )ptr - 1;
-    header->free = FREE; 
+void my_free(void *ptr)
+{
+    if (ptr == NULL)
+        return;
+    Block *header = (Block *)ptr - 1;
+    header->free = FREE;
     list_add_after(&head.list, &header->list);
     coalesce(header);
 }
-int main() {
+int main()
+{
 
     heap_init();
+    list *next = head.list.next;
+    Block *blk = list_entry(next, Block, list);
 
-    printf("Size of Block header %zu\n", BLOCK_SIZE);
-    int * y = my_malloc(sizeof(int));
-    printf("After allocated y: %zu blocks\n", list_length(&head.list));
-    int * x = my_malloc(sizeof(int));
-    printf("After allocated x: %zu blocks\n", list_length(&head.list));
-    double * z = my_malloc(sizeof(double));
-    printf("After allocated z: %zu blocks\n", list_length(&head.list));
+    printf("Size of HEAP %ld\n", HEAP_SIZE);
+    // printf("-----------------------------------\n");
+    //  printf("Size of Block header %zu\n", BLOCK_SIZE);
+    printf("-----------------------------------\n");
+    printf("First free block size is %zu\n", blk->payload);
+    printf("-----------------------------------\n");
+
+    int *y = my_malloc(sizeof(int));
+    // printf("Allocated Y: %zu blocks\n", list_length(&head.list));
+    // printf("-----------------------------------\n");
+    printf("Address of y is at %p\n", y);
+    int *x = my_malloc(sizeof(int));
+    // printf("Allocated X: %zu blocks\n", list_length(&head.list));
+    // printf("-----------------------------------\n");
+    printf("Address of x is at %p\n", x);
+    double *z = my_malloc(sizeof(double));
+    // printf("Allocated Z: %zu blocks\n", list_length(&head.list));
+    // printf("-----------------------------------\n");
+    printf("Address of z is at %p\n", z);
 
     my_free(y);
-    my_free(z);
     my_free(x);
+    my_free(z);
 
-    list* curr = head.list.next; 
+    list *curr = head.list.next;
 
-    while(curr != &head.list) {
-        Block* blk = list_entry(curr, Block, list);
-        printf("free block — size: %zu\n", blk->size);
+    while (curr != &head.list)
+    {
+        Block *blk = list_entry(curr, Block, list);
+        printf("free block — size: %zu\n", blk->payload);
         curr = curr->next;
     }
     printf("Total length is %zu\n", list_length(&head.list));

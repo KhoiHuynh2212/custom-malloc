@@ -8,7 +8,7 @@ all:
 asan:
 	$(CC) $(CFLAGS) $(ASAN) -o my-malloc my-malloc.c
 
-run: all
+run: asan
 	./my-malloc
 
 clean:

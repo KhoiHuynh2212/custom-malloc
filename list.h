@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stddef.h>
-#include <stdint.h>
+#include <assert.h>
 #include <stdbool.h>
 
 /*
@@ -47,7 +47,7 @@ static inline list *list_init(list *what)
  *
  * Don't call this directly — use the list_entry() macro instead.
  */
-static inline void *list_entry_offset(list *what, size_t offset)
+static inline void *container_of(list *what, size_t offset)
 {
     if (what)
     {
@@ -72,7 +72,7 @@ static inline void *list_entry_offset(list *what, size_t offset)
  * Return: Pointer to parent container, or NULL.
  */
 #define list_entry(_what, _t, _m) \
-    ((_t *)list_entry_offset((_what), offsetof(_t, _m)))
+    ((_t *)container_of((_what), offsetof(_t, _m)))
 
 /*
  * list_is_linked - check whether a node is currently in a list
@@ -118,6 +118,16 @@ static inline bool list_is_empty(const list *what)
  */
 static inline void list_add_before(list *pos, list *node)
 {
+    assert(pos);
+    assert(pos->next);
+    assert(pos->prev);
+    assert(pos->prev->next == pos);  /* pos must be in a valid list */
+ 
+    assert(node);
+    assert(node->next);
+    assert(node->prev);
+    assert(node->next == node && node->prev == node); /* node must be detached */
+
     pos->prev->next = node;
     node->prev = pos->prev;
     pos->prev = node;
@@ -149,6 +159,16 @@ static inline void list_add_tail(list *head, list *node)
  */
 static inline void list_add_after(list *pos, list *node)
 {
+    assert(pos);
+    assert(pos->next);
+    assert(pos->prev);
+    assert(pos->prev->next == pos);  /* pos must be in a valid list */
+ 
+    assert(node);
+    assert(node->next);
+    assert(node->prev);
+    assert(node->next == node && node->prev == node); /* node must be detached */
+
     pos->next->prev = node;
     node->next = pos->next;
     node->prev = pos;
@@ -181,6 +201,14 @@ static inline void list_push_front(list *head, list *node)
  */
 static inline void list_add_between(list *left, list *right, list *node)
 {
+    assert(left);
+    assert(right);
+    assert(left->next == right);   /* left and right must be adjacent */
+    assert(right->prev == left);
+ 
+    assert(node);
+    assert(node->next == node && node->prev == node); /* node must be detached */
+
     node->next = right;
     node->prev = left;
     left->next = node;
@@ -204,7 +232,10 @@ static inline void list_add_between(list *left, list *right, list *node)
  * Internal primitive used when caller manages node state manually.
  */
 static inline void list_unlink_stale(list *node)
-{
+{   
+    assert(node->next->prev == node);
+    assert(node->prev->next == node);
+
     node->prev->next = node->next;
     node->next->prev = node->prev;
 }
@@ -314,6 +345,13 @@ static inline list *list_pop_back(list *head)
 static inline void list_replace(list *old, list *news)
 {
 
+    assert(old);
+    assert(list_is_linked(old));                              /* old must be in a list */
+    assert(old->prev->next == old && old->next->prev == old); /* neighbors must agree */
+ 
+    assert(news);
+    assert(news->next == news && news->prev == news); /* news must be detached */
+
     news->next = old->next;
     news->prev = old->prev;
 
@@ -365,6 +403,12 @@ static inline void list_replace_init(list *old, list *news)
 static inline void list_swap(list *entry1, list *entry2)
 {
 
+    assert(entry1);
+    assert(entry2);
+    assert(entry1 != entry2);        /* swapping a node with itself is a bug */
+    assert(list_is_linked(entry1));
+    assert(list_is_linked(entry2));
+
     list *pos = entry2->prev;
 
     list_unlink_stale(entry2);
@@ -414,6 +458,12 @@ static inline bool list_is_last(const list *node, const list *head)
 
 static inline void list_splice(list *target, list *source)
 {
+    assert(target);
+    assert(source);
+    assert(target != source);        /* swapping a node with itself is a bug */
+    assert(list_is_linked(target));
+    assert(list_is_linked(source));
+
     if (!list_is_empty(source))
     {
         /* attach front of @source to the tail of @target*/
