@@ -1,35 +1,4 @@
-#define _GNU_SOURCE
-#include <unistd.h>
-#include <stdio.h>
-#include "list.h"
-
-#define ALIGN _Alignof(max_align_t)
-#define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
-#define MIN_FREE_BLOCK (HEADER_SIZE + FOOTER_SIZE + ALIGN)
-#define FREE 1
-#define ALLOCATED 0
-
-typedef struct Block
-{
-    size_t payload;
-    int free;
-    list list;
-} Block;
-
-#define HEADER_SIZE (sizeof(Block))
-#define FOOTER_SIZE ALIGN_UP(sizeof(size_t))
-#define HEAP_SIZE 128 * 1024 + HEADER_SIZE
-
-#define BLOCK_NEXT_HEADER(curr, payload) \
-    ((Block *)((char *)((curr) + 1) + (payload) + FOOTER_SIZE))
-
-#define BLOCK_PREV_HEADER(curr, prev_size) \
-    ((Block *)((char *)curr - FOOTER_SIZE - prev_size - HEADER_SIZE))
-
-// set function prototypes
-void set_footer(Block *block);
-void free(void *ptr);
-bool try_expand(Block *block, size_t newPayload);
+#include "my-malloc.h"
 
 static Block head = {
     .payload = 0,
@@ -39,21 +8,21 @@ static Block head = {
 static void *heap_start;
 static void *heap_end;
 
+
 void heap_init()
 {
 
     void *start = sbrk(HEAP_SIZE);
 
-    heap_start = start;
-    heap_end = start + HEAP_SIZE;
     if (start == (void *)-1)
     {
         return;
     }
+
+    heap_start = start;
+    heap_end = start + HEAP_SIZE;
     Block *first = (Block *)start;
 
-    printf("The heap is start at %p\n", heap_start);
-    printf("The heap is end at %p\n", heap_end);
     size_t raw_payload = HEAP_SIZE - HEADER_SIZE - FOOTER_SIZE;
 
     first->payload = raw_payload & ~(ALIGN - 1);
@@ -79,7 +48,7 @@ Block *find_suitable_block(size_t requestSize)
 }
 
 // request OS to give more memory if there is no free block
-Block *requestBlock(size_t size)
+Block *request_block(size_t size)
 {
 
     Block *newBlock = NULL;
@@ -117,7 +86,7 @@ Block *split(Block *block, size_t requestPayload)
     return block;
 }
 
-void coalesce(Block *curr)
+Block* coalesce(Block *curr)
 {
 
     Block *next_block = BLOCK_NEXT_HEADER(curr, curr->payload);
@@ -139,9 +108,10 @@ void coalesce(Block *curr)
         {
             prev_block->payload += HEADER_SIZE + FOOTER_SIZE + curr->payload;
             set_footer(prev_block);
-            list_unlink(&curr->list);
+            return prev_block;
         }
     }
+    return curr;
 }
 void set_footer(Block *block)
 {
@@ -149,25 +119,33 @@ void set_footer(Block *block)
         (size_t *)((char *)(block + 1) + block->payload);
 
     *footer = block->payload;
+    assert(*footer == block->payload);
 }
-void *malloc(size_t size)
+void * my_malloc(size_t size)
 {
 
     if (size == 0)
         return NULL;
 
     size_t requestPayload = ALIGN_UP(size); // find align block
-    // size_t total = BLOCK_SIZE + payload + sizeof(size_t);
+    
     Block *block = find_suitable_block(requestPayload);
 
     if (block == NULL)
-    {
-        block = requestBlock(requestPayload);
+    {   
+        size_t extend_size = (requestPayload > CHUNK_SIZE) ? requestPayload : CHUNK_SIZE;
+        block = request_block(extend_size);
 
         if (block == NULL)
         {
             return NULL;
         }
+
+        if (block->payload >= requestPayload + MIN_FREE_BLOCK)
+        {
+            block = split(block, requestPayload);
+        }
+
         return block + 1;
     }
 
@@ -180,14 +158,14 @@ void *malloc(size_t size)
     block->free = ALLOCATED;
     return block + 1;
 }
-void *calloc(size_t num, size_t size)
+void *my_calloc(size_t num, size_t size)
 {
     if (num != 0 && size > __SIZE_MAX__ / num)
     {
         return NULL;
     }
 
-    void *ptr = malloc(num * size);
+    void *ptr = my_malloc(num * size);
     if (ptr == NULL)
     {
         return NULL;
@@ -221,11 +199,11 @@ bool try_expand(Block *curr, size_t newPayload)
     }
 }
 
-void *realloc(void *ptr, size_t size)
+void *my_realloc(void *ptr, size_t size)
 {
     if (ptr == NULL)
     {
-        return malloc(size);
+        return my_malloc(size);
     }
     if (size == 0)
     {
@@ -255,7 +233,7 @@ void *realloc(void *ptr, size_t size)
         return ptr;
     } 
 
-    void* new_ptr = malloc(newPayload);
+    void* new_ptr = my_malloc(newPayload);
     if(new_ptr == NULL) return NULL;
 
     size_t copySize = block->payload;
@@ -267,57 +245,20 @@ void *realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
-void free(void *ptr)
+void my_free(void *ptr)
 {
     if (ptr == NULL)
         return;
     Block *header = (Block *)ptr - 1;
-    header->free = FREE;
-    list_add_after(&head.list, &header->list);
-    coalesce(header);
-}
-int main()
-{
 
-    heap_init();
-    list *next = head.list.next;
-    Block *blk = list_entry(next, Block, list);
-
-    printf("Size of HEAP %ld\n", HEAP_SIZE);
-    // printf("-----------------------------------\n");
-    //  printf("Size of Block header %zu\n", BLOCK_SIZE);
-    printf("-----------------------------------\n");
-    printf("First free block size is %zu\n", blk->payload);
-    printf("-----------------------------------\n");
-
-    int *y = malloc(sizeof(int));
-    // printf("Allocated Y: %zu blocks\n", list_length(&head.list));
-    // printf("-----------------------------------\n");
-    printf("Address of y is at %p\n", y);
-    int *x = malloc(sizeof(int));
-    // printf("Allocated X: %zu blocks\n", list_length(&head.list));
-    // printf("-----------------------------------\n");
-    printf("Address of x is at %p\n", x);
-    double *z = malloc(sizeof(double));
-    // printf("Allocated Z: %zu blocks\n", list_length(&head.list));
-    // printf("-----------------------------------\n");
-    printf("Address of z is at %p\n", z);
-
-    // char* name = my_malloc(100000000);
-    //  printf("Address of name is at %p\n", name);
-
-    my_free(y);
-    my_free(x);
-    my_free(z);
-
-    list *curr = head.list.next;
-
-    while (curr != &head.list)
+    if (header->free == FREE)
     {
-        Block *blk = list_entry(curr, Block, list);
-        printf("free block — size: %zu\n", blk->payload);
-        curr = curr->next;
+        fprintf(stderr, "double free detected at %p\n", ptr);
+        abort();
     }
-    printf("Total length is %zu\n", list_length(&head.list));
-    return 0;
+    header->free = FREE;
+    set_footer(header);
+    Block* survivor = coalesce(header);
+    if (survivor == header)
+        list_add_after(&head.list, &survivor->list);
 }
