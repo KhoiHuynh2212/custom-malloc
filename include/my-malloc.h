@@ -7,14 +7,28 @@
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <math.h>
+#include <sys/mman.h>
 #include "list.h"
 
 #define ALIGN _Alignof(max_align_t)
 #define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
 #define MIN_FREE_BLOCK (HEADER_SIZE + FOOTER_SIZE + ALIGN)
 #define CHUNK_SIZE 4096
-#define FREE 1
-#define ALLOCATED 0
+
+
+#define FREE_BIT      (1 << 0)   // bit 0: 1 = free, 0 = allocated
+#define MMAP_BIT      (1 << 1)   // bit 1: 1 = mmapped, 0 = sbrk'd
+
+#define SET_FREE(b)      ((b)->free |= FREE_BIT)
+#define SET_ALLOCATED(b) ((b)->free &= ~FREE_BIT)
+
+#define IS_FREE(b)        ((b)->free & FREE_BIT) 
+#define IS_MMAP(b)        ((b)->free & MMAP_BIT) 
+
+#define SET_MMAP(b)       ((b)->free |= MMAP_BIT)
+#define SET_SBRK(b)       ((b)->free &= ~MMAP_BIT)  
+ 
 
 typedef struct Block
 {
@@ -24,9 +38,11 @@ typedef struct Block
 } Block;
 
 #define HEADER_SIZE (sizeof(Block))
-#define FOOTER_SIZE ALIGN_UP(sizeof(size_t))
-#define HEAP_SIZE 128 * 1024
+#define FOOTER_SIZE ALIGN_UP(sizeof(size_t)) 
 
+#define ALIGN_HEADER_FOOTER ALIGN_UP(HEADER_SIZE + FOOTER_SIZE)
+#define MMAP_THRESHOLD 128 * 1024 // 128 KB
+#define SHRINK_THRESHOLD (12 * 1024)  // 12KB
 #define BLOCK_NEXT_HEADER(curr, payload) \
     ((Block *)((char *)((curr) + 1) + (payload) + FOOTER_SIZE))
 
@@ -36,15 +52,16 @@ typedef struct Block
 // function prototypes
 void heap_init(void);
 Block *find_suitable_block(size_t requestSize);
-Block *request_block(size_t size);
+Block *request_block();
 Block *split(Block *block, size_t requestPayload);
 Block *coalesce(Block *curr);
-void set_footer(Block *block);
-bool try_expand(Block *block, size_t newPayload);
+
 void my_free(void *ptr);
-void* my_malloc(size_t size);
+void set_footer(Block *block);
+void *my_malloc(size_t size);
 void *my_realloc(void *ptr, size_t size);
-bool try_expand(Block *curr, size_t newPayload);
 void *my_calloc(size_t num, size_t size);
+
+bool try_expand(Block *curr, size_t newPayload);
 
 #endif // MY_MALLOC_H
