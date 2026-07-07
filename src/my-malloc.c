@@ -9,12 +9,12 @@ static void *heap_start;
 static void *heap_end;
 static bool initialized = false;
 
+static list *rover = &head.list;
+
 void heap_init()
 {
 
-    initialized = true;
-
-    if (!initialized)
+    if (initialized)
         return;
 
     void *start = sbrk(MMAP_THRESHOLD);
@@ -24,6 +24,8 @@ void heap_init()
         return;
     }
 
+    initialized = true;
+
     heap_start = start;
     heap_end = start + MMAP_THRESHOLD;
     Block *first = (Block *)start;
@@ -31,46 +33,65 @@ void heap_init()
     size_t raw_payload = MMAP_THRESHOLD - HEADER_SIZE - FOOTER_SIZE;
 
     first->payload = raw_payload & ~(ALIGN - 1);
-    SET_FREE(first);
+    first->free = 0;
     set_footer(first);
+    SET_FREE(first);
     list_init(&first->list);
     list_add_after(&head.list, &first->list);
 }
 
 Block *find_suitable_block(size_t requestSize)
 {
-    list *curr = head.list.next;
-    while (curr != &head.list)
+
+    if (list_is_empty(&head))
+    {
+        return NULL;
+    }
+
+    list *curr = rover->next;
+
+    if (curr == &head.list)
+        curr = curr->next;
+
+    list *start = curr;
+
+    do
     {
         Block *block = list_entry(curr, Block, list);
         if (block->payload >= requestSize)
         {
+            rover = curr;
             return block;
         }
         curr = curr->next;
-    }
+        if (curr == &head.list)
+            curr = curr->next;
+
+    } while (curr != start);
     return NULL;
 }
 
 // request OS to give big chunk of memory
-Block *request_block(void)
+Block *request_block(size_t size)
 {
+    size_t block_chunk = size + HEADER_SIZE + FOOTER_SIZE;
+    size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk;
 
     Block *newBlock = NULL;
-    void *request = sbrk(CHUNK_SIZE);
+    void *request = sbrk(allocate_size);
     if (request == (void *)-1)
     {
         return NULL;
     }
 
     newBlock = (Block *)request;
-    SET_FREE(newBlock);
-    newBlock->payload = CHUNK_SIZE;
+    newBlock->payload = allocate_size - HEADER_SIZE - FOOTER_SIZE;
+    newBlock->free = 0;
     set_footer(newBlock);
+    SET_FREE(newBlock);
     list_init(&newBlock->list);
 
-
-    heap_end = (char *)request + CHUNK_SIZE;
+    heap_end = (char *)request + allocate_size;
     return newBlock;
 }
 
@@ -78,11 +99,16 @@ Block *split(Block *block, size_t requestPayload)
 {
     Block *remainder = BLOCK_NEXT_HEADER(block, requestPayload);
     remainder->payload = block->payload - requestPayload - HEADER_SIZE - FOOTER_SIZE;
+    remainder->free = 0;
     SET_FREE(remainder); // set it as free;
     set_footer(remainder);
     list_init(&remainder->list);
     list_add_after(&head.list, &remainder->list);
 
+    if (rover == &block->list)
+    {
+        rover = &head.list;
+    }
     // block get trimmed and given to the caller
     block->payload = requestPayload;
     SET_ALLOCATED(block); // set it allocated
@@ -99,6 +125,10 @@ Block *coalesce(Block *curr)
 
     if ((char *)next_block < (char *)heap_end && IS_FREE(next_block))
     {
+        if (rover == &next_block->list)
+        {
+            rover = &head.list;
+        }
         curr->payload += HEADER_SIZE + next_block->payload + FOOTER_SIZE;
         set_footer(curr);
         list_unlink(&next_block->list);
@@ -112,6 +142,10 @@ Block *coalesce(Block *curr)
 
         if ((char *)prev_block >= (char *)heap_start && IS_FREE(prev_block))
         {
+            if (rover == &prev_block->list)
+            {
+                rover = &head.list;
+            }
             prev_block->payload += HEADER_SIZE + FOOTER_SIZE + curr->payload;
             set_footer(prev_block);
             return prev_block;
@@ -143,7 +177,8 @@ void *my_malloc(size_t size)
     {
 
         size_t total_need = ALIGN_HEADER_FOOTER + request_size;
-        void *ptr = mmap(NULL, total_need,
+        size_t total_page_up = ((total_need + LINUX_PAGE - 1) & ~(LINUX_PAGE - 1));
+        void *ptr = mmap(NULL, total_page_up,
                          PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
@@ -153,9 +188,10 @@ void *my_malloc(size_t size)
         }
 
         block = (Block *)ptr;
+        block->free = 0;
         SET_ALLOCATED(block);
         SET_MMAP(block);
-        block->payload = request_size;
+        block->payload = total_page_up - HEADER_SIZE - FOOTER_SIZE;
         set_footer(block);
     }
     else
@@ -166,7 +202,7 @@ void *my_malloc(size_t size)
         if (block == NULL)
         {
 
-            block = request_block();
+            block = request_block(request_size);
 
             if (block == NULL)
             {
@@ -258,6 +294,11 @@ void *my_realloc(void *ptr, size_t size)
     size_t new_payload = ALIGN_UP(size);
     Block *block = (Block *)ptr - 1;
 
+    if (rover == &block->list)
+    {
+        rover = &head.list;
+    }
+
     if (!IS_MMAP(block))
     {
         if (new_payload <= block->payload)
@@ -275,6 +316,27 @@ void *my_realloc(void *ptr, size_t size)
 
             return ptr;
         }
+    }
+    else
+    {
+
+        if (new_payload <= block->payload)
+        {
+            return ptr;
+        }
+        void *new_loc;
+        new_loc = mremap(block, block->payload + ALIGN_HEADER_FOOTER, new_payload + ALIGN_HEADER_FOOTER, MREMAP_MAYMOVE);
+        if (new_loc == MAP_FAILED)
+        {
+            perror("mremap");
+            return NULL;
+        }
+
+        Block *nb = (Block *)new_loc;
+        nb->payload = new_payload;
+        set_footer(nb);
+
+        return nb + 1;
     }
 
     new_ptr = my_malloc(size);
@@ -306,7 +368,7 @@ void my_free(void *ptr)
 
     if (IS_MMAP(block))
     {
-
+        // Crash on double free
         munmap(block, ALIGN_HEADER_FOOTER + block->payload);
     }
     else
@@ -320,14 +382,30 @@ void my_free(void *ptr)
         char *block_end = (char *)survivor + HEADER_SIZE + survivor->payload + FOOTER_SIZE;
         if (block_end == (char *)heap_end && survivor->payload >= SHRINK_THRESHOLD)
         {
-            size_t shrink_amount = survivor->payload - ALIGN;
-            list_unlink(&survivor->list);
+            uintptr_t floor = (uintptr_t)heap_start + MMAP_THRESHOLD;
+            uintptr_t new_break = (uintptr_t)heap_end - survivor->payload + SHRINK_KEEP;
 
-            survivor->payload = ALIGN;
-            set_footer(survivor);
-            list_add_after(&head.list, &survivor->list);
-            heap_end = (char *)heap_end - shrink_amount;
-            sbrk(-shrink_amount);
+            // Clamp to the floor
+            if (new_break < floor)
+            {
+                new_break = floor;
+            }
+
+            // Calculate actual bytes to give back
+            size_t actual_shrink_amt = (uintptr_t)heap_end - new_break;
+
+            if (actual_shrink_amt > 0)
+            {
+                list_unlink(&survivor->list);
+
+                // Calculate the new payload size based on the actual new break
+                survivor->payload = (size_t)(new_break - (uintptr_t)survivor - HEADER_SIZE - FOOTER_SIZE);
+                set_footer(survivor);
+                list_add_after(&head.list, &survivor->list);
+
+                heap_end = (char *)new_break;
+                sbrk(-(intptr_t)actual_shrink_amt);
+            }
         }
     }
 }

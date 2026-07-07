@@ -601,6 +601,30 @@ static void phase_realloc_growth(phase_ctx_t *ctx)
 
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Phase registry -- add new phases here, nowhere else.                 */
+/*                                                                       */
+/* Same idea as the TestCase registry in test-basic.c/test-edge-       */
+/* cases.c: a phase_fn written but never added to this table would       */
+/* previously mean editing main() by hand and risking a typo or a       */
+/* forgotten call. Now adding a phase is one line here.                 */
+/* ------------------------------------------------------------------ */
+
+typedef void (*phase_fn)(phase_ctx_t *);
+
+typedef struct {
+    const char *name;
+    phase_fn fn;
+} PhaseCase;
+
+static const PhaseCase phases[] = {
+    {"fixed_churn",      phase_fixed_churn},
+    {"random_churn",     phase_random_churn},
+    {"growth_only",      phase_growth_only},
+    {"fragmentation",    phase_fragmentation},
+    {"realloc_growth",   phase_realloc_growth},
+};
+
 int main(int argc, char **argv)
 {
     config_t cfg = parse_args(argc, argv);
@@ -636,11 +660,10 @@ int main(int argc, char **argv)
 
     phase_ctx_t ctx = {.cfg = &cfg, .scratch = scratch};
 
-    run_phase(&cfg, phase_fixed_churn, &ctx);
-    run_phase(&cfg, phase_random_churn, &ctx);
-    run_phase(&cfg, phase_growth_only, &ctx);
-    run_phase(&cfg, phase_fragmentation, &ctx);
-    run_phase(&cfg, phase_realloc_growth, &ctx);
+    size_t num_phases = sizeof(phases) / sizeof(phases[0]);
+    for (size_t i = 0; i < num_phases; i++) {
+        run_phase(&cfg, phases[i].fn, &ctx);
+    }
 
     printf("\nDone.");
     if (g_csv) {

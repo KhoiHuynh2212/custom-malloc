@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <math.h>
 #include <sys/mman.h>
@@ -14,8 +15,10 @@
 #define ALIGN _Alignof(max_align_t)
 #define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
 #define MIN_FREE_BLOCK (HEADER_SIZE + FOOTER_SIZE + ALIGN)
+#define SHRINK_KEEP 2048 
 #define CHUNK_SIZE 4096
 
+#define LINUX_PAGE sysconf(_SC_PAGESIZE)
 
 #define FREE_BIT      (1 << 0)   // bit 0: 1 = free, 0 = allocated
 #define MMAP_BIT      (1 << 1)   // bit 1: 1 = mmapped, 0 = sbrk'd
@@ -52,7 +55,7 @@ typedef struct Block
 // function prototypes
 void heap_init(void);
 Block *find_suitable_block(size_t requestSize);
-Block *request_block();
+Block *request_block(size_t size);
 Block *split(Block *block, size_t requestPayload);
 Block *coalesce(Block *curr);
 

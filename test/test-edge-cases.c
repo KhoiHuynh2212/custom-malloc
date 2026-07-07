@@ -5,8 +5,8 @@
  *   gcc -Wall -Wextra -std=c11 -Iinclude -g \
  *       -o test/test-edge-cases src/my-malloc.c test/test-edge-cases.c
  *
- * Build with sanitizers (now safe to use, since the allocator no longer
- * shadows libc's malloc/calloc/realloc/free symbol names):
+ * Build with sanitizers (safe to use, allocator no longer shadows libc's
+ * malloc/calloc/realloc/free symbol names):
  *   gcc -Wall -Wextra -std=c11 -Iinclude -fsanitize=address,undefined -g \
  *       -o test/test-edge-cases src/my-malloc.c test/test-edge-cases.c
  *
@@ -16,12 +16,21 @@
  *
  * DESIGN NOTES (production techniques used here):
  *
- *  - Crash isolation: tests that are *expected* to abort or crash the
- *    process (double free, etc.) are run in a forked child via
- *    run_isolated(). The parent inspects the exit status/signal instead
- *    of dying with the child. This mirrors how real test frameworks
- *    implement "death tests" (e.g. GoogleTest's ASSERT_DEATH) so one
- *    intentionally-fatal case can't take the whole suite down.
+ *  - Registry-driven, fork-per-test isolation: every test is registered
+ *    once in `tests[]` and run in its own forked child process. If a test
+ *    segfaults or aborts unexpectedly, only that child dies -- the parent
+ *    sees it via waitpid(), reports it as a failure, and moves on to the
+ *    next test instead of losing the rest of the suite's results.
+ *  - Nested death-test isolation: test_double_free() additionally forks
+ *    *inside itself* via run_isolated(), because that test's whole point
+ *    is to confirm a SIGABRT happens on purpose. This nests cleanly inside
+ *    the outer per-test fork -- the outer fork protects the suite from
+ *    surprise crashes, the inner fork lets one specific test catch an
+ *    *intentional* crash and turn it into a normal CHECK() pass/fail.
+ *  - Shared-memory counters: because CHECK() may now run inside a forked
+ *    child, the pass/fail counters live in an mmap(MAP_SHARED) region so
+ *    every generation of child can update them and the parent still sees
+ *    the final tally after all children exit.
  *  - White-box inspection: Block is a fully defined (non-opaque) struct
  *    in my-malloc.h, so several tests reach past the malloc/free API and
  *    directly inspect ->payload/->free/->list to confirm internal
@@ -47,6 +56,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <signal.h>
 #include <time.h>
 
@@ -54,8 +64,13 @@
 /* Tiny test framework                                                 */
 /* ------------------------------------------------------------------ */
 
-static int g_checks_run = 0;
-static int g_checks_failed = 0;
+typedef struct {
+    int checks_run;
+    int checks_failed;
+} SharedCounters;
+
+static SharedCounters *counters;
+static int current_test_failed = 0;
 static int g_verbose = 0;
 
 static const char *COL_RED = "";
@@ -75,13 +90,14 @@ static void enable_color_if_tty(void)
 
 #define CHECK(cond, msg)                                                    \
     do {                                                                    \
-        g_checks_run++;                                                     \
+        counters->checks_run++;                                            \
         if (cond) {                                                         \
             printf("  %s[PASS]%s %s\n", COL_GREEN, COL_RESET, msg);         \
         } else {                                                            \
             printf("  %s[FAIL]%s %s  (test-edge-cases.c:%d)\n",             \
                    COL_RED, COL_RESET, msg, __LINE__);                      \
-            g_checks_failed++;                                              \
+            counters->checks_failed++;                                     \
+            current_test_failed++;                                        \
         }                                                                   \
     } while (0)
 
@@ -101,6 +117,12 @@ static void vlog(const char *fmt, ...)
 /*
  * run_isolated - run @fn in a forked child so an abort()/segfault in it
  * doesn't take down the whole test binary.
+ *
+ * This is a *nested* fork: it's called from inside a test function that
+ * is itself already running inside the outer per-test child forked by
+ * main(). That's fine -- shared memory survives across nested forks, and
+ * each layer is protecting against a different thing (outer: a surprise
+ * crash anywhere; inner: confirming an *intentional* crash happens).
  *
  * Returns:
  *   1 if the child exited normally with status 0
@@ -516,7 +538,7 @@ typedef struct {
     int live;
 } tracked_t;
 
-static void test_fuzz_mixed_ops(unsigned seed)
+static void test_fuzz_mixed_ops_seeded(unsigned seed)
 {
     SECTION("fuzz: mixed my_malloc/my_realloc/my_free with checksum verification");
     printf("  (seed = %u -- rerun with this seed to reproduce exactly)\n", seed);
@@ -592,7 +614,41 @@ static void test_fuzz_mixed_ops(unsigned seed)
     }
 }
 
+/* TestCase.fn is void(*)(void), but the fuzz test wants a seed. This thin
+ * wrapper draws the seed itself (from the clock) so it still fits the
+ * registry's uniform signature -- the seed is printed either way, so a
+ * failing run is still exactly reproducible. */
+static void test_fuzz_mixed_ops(void)
+{
+    test_fuzz_mixed_ops_seeded((unsigned)time(NULL));
+}
+
 /* ------------------------------------------------------------------ */
+/* Registry -- add new tests here, nowhere else.                       */
+/* ------------------------------------------------------------------ */
+
+typedef void (*test_fn)(void);
+
+typedef struct {
+    const char *name;
+    test_fn fn;
+} TestCase;
+
+static const TestCase tests[] = {
+    {"NULL handling",                        test_null_handling},
+    {"double free detection",                test_double_free},
+    {"alignment guarantees",                 test_alignment},
+    {"zero-size variants",                   test_zero_size_variants},
+    {"split threshold",                      test_split_threshold},
+    {"forward coalescing",                   test_forward_coalesce},
+    {"backward coalescing",                  test_backward_coalesce},
+    {"three-way coalescing",                 test_three_way_coalesce},
+    {"large allocation extends heap",        test_large_allocation_extends_heap},
+    {"many extensions stay consistent",      test_many_extensions_stay_consistent},
+    {"realloc forced relocation",            test_realloc_forced_relocation},
+    {"canary survival",                      test_canary_survival},
+    {"fuzz: mixed ops",                      test_fuzz_mixed_ops},
+};
 
 int main(int argc, char **argv)
 {
@@ -603,30 +659,64 @@ int main(int argc, char **argv)
     }
     enable_color_if_tty();
 
+    /* Unbuffered stdout matters here: every test's child exits via
+     * _exit(), which skips flushing stdio buffers. Buffered output
+     * written just before a crash would otherwise vanish silently. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     heap_init();
 
-    test_null_handling();
-    test_double_free();
-    test_alignment();
-    test_zero_size_variants();
-    test_split_threshold();
-    test_forward_coalesce();
-    test_backward_coalesce();
-    test_three_way_coalesce();
-    test_large_allocation_extends_heap();
-    test_many_extensions_stay_consistent();
-    test_realloc_forced_relocation();
-    test_canary_survival();
-    test_fuzz_mixed_ops((unsigned)time(NULL));
+    /* Shared memory so every forked child's CHECK() results (including
+     * grandchildren, from the nested double-free test) are visible back
+     * in the parent once each child exits. */
+    counters = mmap(NULL, sizeof(SharedCounters), PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    counters->checks_run = 0;
+    counters->checks_failed = 0;
+
+    size_t num_tests = sizeof(tests) / sizeof(tests[0]);
+    int suites_failed = 0;
+    int suites_crashed = 0;
+
+    for (size_t i = 0; i < num_tests; i++) {
+        fflush(stdout); /* flush before fork so the child doesn't inherit a stale buffer */
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* child: run exactly one test, then report pass/fail via exit code */
+            current_test_failed = 0;
+            tests[i].fn();
+            _exit(current_test_failed ? 1 : 0);
+        }
+
+        int status;
+        waitpid(pid, &status, 0);
+
+        if (WIFSIGNALED(status)) {
+            printf("  %s[CRASH]%s '%s' terminated by signal %d (%s)\n",
+                   COL_RED, COL_RESET, tests[i].name,
+                   WTERMSIG(status), strsignal(WTERMSIG(status)));
+            suites_crashed++;
+            suites_failed++;
+        } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            suites_failed++;
+        }
+    }
 
     printf("\n=====================================\n");
-    if (g_checks_failed == 0) {
-        printf("%s%d/%d checks passed%s\n", COL_GREEN, g_checks_run, g_checks_run, COL_RESET);
+    if (counters->checks_failed == 0 && suites_failed == 0) {
+        printf("%s%d/%d checks passed across %zu test suites%s\n",
+               COL_GREEN, counters->checks_run, counters->checks_run, num_tests, COL_RESET);
     } else {
-        printf("%s%d/%d checks passed (%d FAILED)%s\n", COL_RED,
-               g_checks_run - g_checks_failed, g_checks_run, g_checks_failed, COL_RESET);
+        printf("%s%d/%d checks passed across %zu test suites%s\n",
+               COL_RED, counters->checks_run - counters->checks_failed,
+               counters->checks_run, num_tests, COL_RESET);
     }
-    printf("=====================================\n");
+    printf("%d suite%s failed", suites_failed, suites_failed == 1 ? "" : "s");
+    if (suites_crashed) {
+        printf(" (%d crashed the test process)", suites_crashed);
+    }
+    printf("\n=====================================\n");
 
-    return g_checks_failed == 0 ? 0 : 1;
+    return suites_failed == 0 ? 0 : 1;
 }
