@@ -43,7 +43,7 @@ void heap_init()
 Block *find_suitable_block(size_t requestSize)
 {
 
-    if (list_is_empty(&head))
+    if (list_is_empty(&head.list))
     {
         return NULL;
     }
@@ -229,6 +229,11 @@ void *my_malloc(size_t size)
             return block + 1;
         }
 
+        if (rover == &block->list)
+        {
+            rover = &head.list;
+        }
+
         list_unlink(&block->list); // only unlink if it came from free list
         SET_ALLOCATED(block);      // mark as allocated (clear free bit)
         SET_SBRK(block);           // mark as sbrk'd (clear mmap bit)
@@ -270,6 +275,10 @@ bool try_expand(Block *curr, size_t newPayload)
     }
     else
     {
+        if (rover == &next->list)
+        {
+            rover = &head.list;
+        }
         curr->payload = merge_size;
         set_footer(curr);
         list_unlink(&next->list);
@@ -301,6 +310,7 @@ void *my_realloc(void *ptr, size_t size)
 
     if (!IS_MMAP(block))
     {
+
         if (new_payload <= block->payload)
         {
             if (block->payload >= new_payload + MIN_FREE_BLOCK)
@@ -316,6 +326,28 @@ void *my_realloc(void *ptr, size_t size)
 
             return ptr;
         }
+
+        Block *next_block = BLOCK_NEXT_HEADER(block, block->payload);
+
+        if ((char *)next_block == (char *)heap_end)
+        {
+
+            size_t shortfall = new_payload - block->payload;
+            size_t allocated_size = (shortfall < CHUNK_SIZE) ? CHUNK_SIZE : shortfall;
+
+            // automatically extend the program break and update its heap and payload
+            void *request = sbrk(allocated_size);
+            if (request != (void *)-1)
+            {
+                block->payload += allocated_size;
+                set_footer(block);
+                heap_end += allocated_size;
+
+                if (block->payload >= new_payload + MIN_FREE_BLOCK)
+                    split(block, new_payload);
+                return ptr;
+            }
+        }
     }
     else
     {
@@ -324,6 +356,7 @@ void *my_realloc(void *ptr, size_t size)
         {
             return ptr;
         }
+
         void *new_loc;
         new_loc = mremap(block, block->payload + ALIGN_HEADER_FOOTER, new_payload + ALIGN_HEADER_FOOTER, MREMAP_MAYMOVE);
         if (new_loc == MAP_FAILED)
@@ -396,6 +429,11 @@ void my_free(void *ptr)
 
             if (actual_shrink_amt > 0)
             {
+                if (rover == &survivor->list)
+                {
+                    rover = &head.list;
+                }
+
                 list_unlink(&survivor->list);
 
                 // Calculate the new payload size based on the actual new break
