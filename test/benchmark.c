@@ -53,19 +53,40 @@
  *     state per benchmark case (see above) -- the same idea behind
  *     "death tests" / isolated benchmark runners in other frameworks
  *   - CLOCK_MONOTONIC timing (immune to wall-clock adjustments)
+ *   - CLOCK-OVERHEAD CALIBRATION + ADAPTIVE BATCHED SAMPLING: this
+ *     allocator's steady-state operations run in the tens of
+ *     nanoseconds. A single clock_gettime() call, even via the fast
+ *     vDSO path, commonly costs somewhere in that SAME range. Timing
+ *     every individual op the naive way (clock, do the op, clock
+ *     again) means the benchmark is substantially measuring its own
+ *     timer, not the allocator -- a result that looks impressively
+ *     fast and is largely meaningless. This file measures the timer's
+ *     own overhead first, then groups operations into batches sized
+ *     so each timed interval is at least ~1000x that overhead, and
+ *     computes percentiles across batches instead of individual ops.
+ *     This is the same technique Google Benchmark and criterion.rs use
+ *     for sub-microsecond code, for the same reason. Every result row
+ *     prints the batch size and sample count it used, so the
+ *     methodology is visible, not hidden behind a clean-looking number.
+ *   - CPU AFFINITY PINNING: each phase's process is pinned to CPU 0
+ *     before it runs, so a mid-run scheduler migration to a different
+ *     core doesn't show up disguised as an allocator latency spike.
+ *   - PEAK RSS ACCOUNTING via getrusage(), alongside the existing
+ *     sbrk-delta heap-growth accounting -- sbrk tells you what the
+ *     allocator asked the OS for, RSS tells you what's actually
+ *     resident, which can diverge under different workloads.
+ *   - EXPLICIT ALLOCATION-FAILURE COUNTING on every single call in
+ *     every phase, for both allocators. A silently-ignored NULL return
+ *     that gets passed straight to free() would previously just look
+ *     like a fast, successful operation.
  *   - warm-up phase before every measured run (avoids first-touch /
  *     cold-cache / lazy-page-fault skew)
- *   - per-operation latency sampling + full percentile breakdown
- *     (p50/p90/p99/max), not just an average -- averages hide tail
- *     latency, which is usually what actually matters for allocators
  *   - a compiler-barrier "escape" hatch so -O2 can't dead-code-eliminate
  *     allocations the benchmark never reads from (the classic
  *     DoNotOptimize trick from Google Benchmark)
  *   - multiple realistic workload shapes, not just one loop:
  *       fixed-size churn, random-size churn, growth-only, fragmentation-
  *       inducing alternation, and a realloc-heavy pattern
- *   - sbrk(0)-based heap growth accounting to report actual memory
- *     overhead (bytes taken from the OS vs. bytes the caller asked for)
  *   - deterministic, printed PRNG seed for reproducibility
  *   - machine-readable CSV output alongside the human-readable report,
  *     correctly flushed across process boundaries (see child_finish())
@@ -80,6 +101,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <sched.h>
 
 /* ------------------------------------------------------------------ */
 /* Compiler barrier so -O2 can't optimize benchmarked work away        */
@@ -115,7 +138,8 @@ typedef struct {
     double max_ns;
     double total_sec;
     double ops_per_sec;
-    size_t n;
+    size_t n;         /* number of timed samples (batches, not raw ops) */
+    long batch_size;  /* ops amortized per sample -- 0 if not batched */
 } stats_t;
 
 static stats_t compute_stats(double *latencies_ns, size_t n, double total_sec)
@@ -141,8 +165,87 @@ static stats_t compute_stats(double *latencies_ns, size_t n, double total_sec)
 
 static void print_stats_row(const char *label, const stats_t *s)
 {
-    printf("  %-32s %12.0f ops/s  mean=%8.1fns  p50=%8.1fns  p90=%8.1fns  p99=%8.1fns  max=%10.1fns\n",
-           label, s->ops_per_sec, s->mean_ns, s->p50_ns, s->p90_ns, s->p99_ns, s->max_ns);
+    printf("  %-32s %12.0f ops/s  mean=%8.1fns  p50=%8.1fns  p90=%8.1fns  p99=%8.1fns  max=%10.1fns"
+           "  [batch=%ld samples=%zu]\n",
+           label, s->ops_per_sec, s->mean_ns, s->p50_ns, s->p90_ns, s->p99_ns, s->max_ns,
+           s->batch_size, s->n);
+}
+
+/* ------------------------------------------------------------------ */
+/* Clock-overhead calibration                                          */
+/*                                                                      */
+/* Measures the mean cost of a back-to-back clock_gettime() pair, plus */
+/* the timer's reported resolution. Printed once at startup and used   */
+/* by run_batched() (below) to pick a batch size that keeps the        */
+/* timer's own cost a negligible fraction of every measured interval.  */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    double overhead_ns;
+    double res_ns;
+} clock_info_t;
+
+static clock_info_t calibrate_clock(void)
+{
+    clock_info_t info = {0};
+
+    struct timespec res;
+    if (clock_getres(CLOCK_MONOTONIC, &res) == 0) {
+        info.res_ns = (double)res.tv_sec * 1e9 + (double)res.tv_nsec;
+    }
+
+    /* warm up the vDSO path before measuring it */
+    for (int i = 0; i < 2000; i++) {
+        double t = now_sec();
+        escape(&t);
+    }
+
+    enum { SAMPLES = 50000 };
+    double total = 0.0;
+    for (int i = 0; i < SAMPLES; i++) {
+        double a = now_sec();
+        double b = now_sec();
+        total += (b - a);
+    }
+    info.overhead_ns = (total / SAMPLES) * 1e9;
+    if (info.overhead_ns < 0) info.overhead_ns = 0;
+    return info;
+}
+
+/* ------------------------------------------------------------------ */
+/* CPU affinity pinning                                                */
+/*                                                                      */
+/* Pins the calling process to CPU 0 so a scheduler-driven migration    */
+/* mid-phase doesn't show up disguised as allocator latency. Best-      */
+/* effort: a failure here degrades measurement quality but shouldn't    */
+/* abort the run, so it's reported as a warning, not a fatal error.     */
+/* ------------------------------------------------------------------ */
+
+static void pin_to_cpu0(void)
+{
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(0, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        fprintf(stderr, "benchmark: warning: sched_setaffinity failed (%s) -- "
+                        "results may show extra jitter from core migration\n",
+                strerror(errno));
+    }
+#else
+    fprintf(stderr, "benchmark: warning: CPU pinning not implemented on this platform\n");
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* Peak RSS accounting                                                  */
+/* ------------------------------------------------------------------ */
+
+static long peak_rss_kb(void)
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return -1;
+    return (long)ru.ru_maxrss; /* KB on Linux */
 }
 
 /* ------------------------------------------------------------------ */
@@ -154,16 +257,16 @@ static FILE *g_csv = NULL;
 static void csv_header(void)
 {
     if (!g_csv) return;
-    fprintf(g_csv, "benchmark,allocator,ops,ops_per_sec,mean_ns,p50_ns,p90_ns,p99_ns,max_ns,total_sec\n");
+    fprintf(g_csv, "benchmark,allocator,samples,ops_per_sec,mean_ns,p50_ns,p90_ns,p99_ns,max_ns,total_sec,alloc_failures\n");
     fflush(g_csv);
 }
 
-static void csv_row(const char *bench, const char *alloc, const stats_t *s)
+static void csv_row(const char *bench, const char *alloc, const stats_t *s, long fail)
 {
     if (!g_csv) return;
-    fprintf(g_csv, "%s,%s,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f\n",
+    fprintf(g_csv, "%s,%s,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%ld\n",
             bench, alloc, s->n, s->ops_per_sec, s->mean_ns,
-            s->p50_ns, s->p90_ns, s->p99_ns, s->max_ns, s->total_sec);
+            s->p50_ns, s->p90_ns, s->p99_ns, s->max_ns, s->total_sec, fail);
 }
 
 /* ------------------------------------------------------------------ */
@@ -190,6 +293,10 @@ static void print_usage(const char *prog)
     printf("              so every phase measures a cold heap, uncontaminated by earlier\n");
     printf("              phases' leftover free-list capacity or heap growth\n");
     printf("  --help      show this message\n");
+    printf("\n");
+    printf("Every run also: calibrates clock_gettime() overhead and picks an adaptive\n");
+    printf("batch size so timer cost stays negligible, pins each phase to CPU 0, and\n");
+    printf("tracks peak RSS and allocation failures. See the file header for details.\n");
 }
 
 static config_t parse_args(int argc, char **argv)
@@ -245,6 +352,7 @@ static long sbrk_delta_bytes(void *before)
 typedef struct {
     config_t *cfg;
     double *scratch;
+    clock_info_t clock;
 } phase_ctx_t;
 
 /*
@@ -266,11 +374,13 @@ static void child_finish(int status)
 /*
  * run_phase - execute one benchmark phase.
  *
- * In isolated mode: forks a fresh child, which calls heap_init() itself
- * (guaranteed cold, since the parent never has) and then runs @fn.
+ * In isolated mode: forks a fresh child, which pins itself to CPU 0,
+ * calls heap_init() itself (guaranteed cold, since the parent never
+ * has) and then runs @fn.
  *
  * In shared mode: just calls @fn directly in the current process, whose
- * heap was already initialized once at the top of main().
+ * heap was already initialized once (and which was already pinned) at
+ * the top of main().
  */
 static void run_phase(config_t *cfg, void (*fn)(phase_ctx_t *), phase_ctx_t *ctx)
 {
@@ -290,6 +400,7 @@ static void run_phase(config_t *cfg, void (*fn)(phase_ctx_t *), phase_ctx_t *ctx
         return;
     }
     if (pid == 0) {
+        pin_to_cpu0();
         heap_init();
         fn(ctx);
         child_finish(0);
@@ -303,128 +414,202 @@ static void run_phase(config_t *cfg, void (*fn)(phase_ctx_t *), phase_ctx_t *ctx
 }
 
 /* ------------------------------------------------------------------ */
+/* Batched timing infrastructure                                        */
+/*                                                                      */
+/* See the CLOCK-OVERHEAD CALIBRATION note in the file header for the   */
+/* full rationale. Short version: for operations this fast, timing      */
+/* each one individually mostly measures the timer. This groups ops     */
+/* into adaptively-sized batches, times each batch as one interval, and */
+/* divides by the batch size to get an amortized per-op cost. A short   */
+/* probe run estimates per-op cost first so the batch size can be       */
+/* chosen to keep timer overhead comfortably below 0.1% of each         */
+/* measured interval, without wasting the whole op budget on one giant  */
+/* batch (which would leave too few samples for meaningful percentiles).*/
+/* ------------------------------------------------------------------ */
+
+typedef void (*op_fn_t)(void *ctx, long i);
+
+static stats_t run_batched(op_fn_t op, void *ctx, long total_ops,
+                            double *scratch, double overhead_ns)
+{
+    stats_t empty = {0};
+    if (total_ops <= 0) return empty;
+
+    enum { PROBE = 256 };
+    long probe_n = total_ops < PROBE ? total_ops : PROBE;
+
+    double t0 = now_sec();
+    for (long i = 0; i < probe_n; i++) op(ctx, i);
+    double probe_elapsed = now_sec() - t0;
+    double per_op_ns = probe_n > 0 ? (probe_elapsed / (double)probe_n) * 1e9 : 100.0;
+    if (per_op_ns < 1.0) per_op_ns = 1.0;
+
+    /* Target: each batch's wall time is >= 1000x the timer's own
+     * overhead, so the timer contributes well under 0.1% of what's
+     * measured. Floor of 2us/batch guards against a zero/tiny overhead
+     * reading producing a degenerate batch size of 1. */
+    double target_batch_ns = overhead_ns * 1000.0;
+    if (target_batch_ns < 2000.0) target_batch_ns = 2000.0;
+    long batch = (long)(target_batch_ns / per_op_ns) + 1;
+    if (batch < 16) batch = 16;
+
+    long remaining = total_ops - probe_n;
+    if (remaining <= 0) {
+        /* whole run fit inside the probe -- report it as one sample */
+        scratch[0] = per_op_ns;
+        stats_t s = compute_stats(scratch, 1, probe_elapsed);
+        s.ops_per_sec = probe_elapsed > 0 ? (double)probe_n / probe_elapsed : 0;
+        s.batch_size = probe_n;
+        return s;
+    }
+
+    long num_batches = remaining / batch;
+    if (num_batches < 1) { batch = remaining; num_batches = 1; }
+
+    long i = probe_n;
+    double total_elapsed = probe_elapsed;
+    size_t n = 0;
+    for (long b = 0; b < num_batches; b++) {
+        double bt0 = now_sec();
+        for (long j = 0; j < batch; j++, i++) op(ctx, i);
+        double bt1 = now_sec();
+        total_elapsed += (bt1 - bt0);
+        scratch[n++] = ((bt1 - bt0) / (double)batch) * 1e9;
+    }
+    /* leftover ops that didn't fill one final batch -- still executed,
+     * just not individually timed, so semantics (e.g. sequential PRNG
+     * state, ptrs[i] index coverage) stay identical to an unbatched run */
+    for (; i < total_ops; i++) op(ctx, i);
+
+    stats_t s = compute_stats(scratch, n, total_elapsed);
+    s.ops_per_sec = total_elapsed > 0 ? (double)total_ops / total_elapsed : 0;
+    s.batch_size = batch;
+    return s;
+}
+
+/* ------------------------------------------------------------------ */
 /* Workload 1: fixed-size churn (alloc N, immediately free)             */
 /* ------------------------------------------------------------------ */
 
-static stats_t bench_fixed_churn_custom(long ops, size_t size, double *scratch)
-{
-    for (long i = 0; i < ops / 10; i++) {
-        void *p = my_malloc(size);
-        escape(p);
-        my_free(p);
-    }
+typedef struct { size_t size; long fail; } churn_ctx_t;
 
-    double t0 = now_sec();
-    for (long i = 0; i < ops; i++) {
-        double s = now_sec();
-        void *p = my_malloc(size);
-        escape(p);
-        my_free(p);
-        scratch[i] = (now_sec() - s) * 1e9;
-    }
-    double total = now_sec() - t0;
-    return compute_stats(scratch, (size_t)ops, total);
+static void op_fixed_churn_custom(void *vctx, long i)
+{
+    (void)i;
+    churn_ctx_t *c = (churn_ctx_t *)vctx;
+    void *p = my_malloc(c->size);
+    escape(p);
+    if (!p) { c->fail++; return; }
+    my_free(p);
 }
 
-static stats_t bench_fixed_churn_libc(long ops, size_t size, double *scratch)
+static void op_fixed_churn_libc(void *vctx, long i)
 {
-    for (long i = 0; i < ops / 10; i++) {
-        void *p = malloc(size);
-        escape(p);
-        free(p);
-    }
-
-    double t0 = now_sec();
-    for (long i = 0; i < ops; i++) {
-        double s = now_sec();
-        void *p = malloc(size);
-        escape(p);
-        free(p);
-        scratch[i] = (now_sec() - s) * 1e9;
-    }
-    double total = now_sec() - t0;
-    return compute_stats(scratch, (size_t)ops, total);
+    (void)i;
+    churn_ctx_t *c = (churn_ctx_t *)vctx;
+    void *p = malloc(c->size);
+    escape(p);
+    if (!p) { c->fail++; return; }
+    free(p);
 }
 
 static void phase_fixed_churn(phase_ctx_t *ctx)
 {
     printf("\n-- Fixed-size churn (64 bytes, my_malloc immediately followed by my_free) --\n");
-    stats_t s = bench_fixed_churn_custom(ctx->cfg->ops, 64, ctx->scratch);
-    print_stats_row("my-malloc", &s);
-    csv_row("fixed_churn_64b", "my-malloc", &s);
-    if (!ctx->cfg->skip_libc) {
-        stats_t sl = bench_fixed_churn_libc(ctx->cfg->ops, 64, ctx->scratch);
-        print_stats_row("glibc malloc", &sl);
-        csv_row("fixed_churn_64b", "glibc", &sl);
+
+    for (long i = 0; i < ctx->cfg->ops / 10; i++) {
+        void *p = my_malloc(64);
+        escape(p);
+        my_free(p);
     }
+
+    churn_ctx_t cctx = {.size = 64, .fail = 0};
+    stats_t s = run_batched(op_fixed_churn_custom, &cctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
+    print_stats_row("my-malloc", &s);
+    if (cctx.fail) fprintf(stderr, "  WARNING: my_malloc failed %ld/%ld times in this phase\n", cctx.fail, ctx->cfg->ops);
+    csv_row("fixed_churn_64b", "my-malloc", &s, cctx.fail);
+
+    if (!ctx->cfg->skip_libc) {
+        for (long i = 0; i < ctx->cfg->ops / 10; i++) {
+            void *p = malloc(64);
+            escape(p);
+            free(p);
+        }
+        churn_ctx_t lctx = {.size = 64, .fail = 0};
+        stats_t sl = run_batched(op_fixed_churn_libc, &lctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
+        print_stats_row("glibc malloc", &sl);
+        if (lctx.fail) fprintf(stderr, "  WARNING: glibc malloc failed %ld/%ld times in this phase\n", lctx.fail, ctx->cfg->ops);
+        csv_row("fixed_churn_64b", "glibc", &sl, lctx.fail);
+    }
+
+    printf("  %-32s peak RSS so far: %ld KB\n", "", peak_rss_kb());
 }
 
 /* ------------------------------------------------------------------ */
 /* Workload 2: random-size churn (simulates a realistic mixed workload) */
 /* ------------------------------------------------------------------ */
 
+typedef struct { unsigned state; long fail; } random_ctx_t;
+
 static size_t rand_size(unsigned *state)
 {
     return (size_t)(rand_r(state) % 2048) + 1;
 }
 
-static stats_t bench_random_churn_custom(long ops, unsigned seed, double *scratch)
+static void op_random_churn_custom(void *vctx, long i)
 {
-    unsigned state = seed;
-    for (long i = 0; i < ops / 10; i++) {
-        void *p = my_malloc(rand_size(&state));
-        escape(p);
-        my_free(p);
-    }
-
-    state = seed;
-    double t0 = now_sec();
-    for (long i = 0; i < ops; i++) {
-        size_t sz = rand_size(&state);
-        double s = now_sec();
-        void *p = my_malloc(sz);
-        escape(p);
-        my_free(p);
-        scratch[i] = (now_sec() - s) * 1e9;
-    }
-    double total = now_sec() - t0;
-    return compute_stats(scratch, (size_t)ops, total);
+    (void)i;
+    random_ctx_t *c = (random_ctx_t *)vctx;
+    size_t sz = rand_size(&c->state);
+    void *p = my_malloc(sz);
+    escape(p);
+    if (!p) { c->fail++; return; }
+    my_free(p);
 }
 
-static stats_t bench_random_churn_libc(long ops, unsigned seed, double *scratch)
+static void op_random_churn_libc(void *vctx, long i)
 {
-    unsigned state = seed;
-    for (long i = 0; i < ops / 10; i++) {
-        void *p = malloc(rand_size(&state));
-        escape(p);
-        free(p);
-    }
-
-    state = seed;
-    double t0 = now_sec();
-    for (long i = 0; i < ops; i++) {
-        size_t sz = rand_size(&state);
-        double s = now_sec();
-        void *p = malloc(sz);
-        escape(p);
-        free(p);
-        scratch[i] = (now_sec() - s) * 1e9;
-    }
-    double total = now_sec() - t0;
-    return compute_stats(scratch, (size_t)ops, total);
+    (void)i;
+    random_ctx_t *c = (random_ctx_t *)vctx;
+    size_t sz = rand_size(&c->state);
+    void *p = malloc(sz);
+    escape(p);
+    if (!p) { c->fail++; return; }
+    free(p);
 }
 
 static void phase_random_churn(phase_ctx_t *ctx)
 {
     printf("\n-- Random-size churn (1..2048 bytes, my_malloc immediately followed by my_free) --\n");
-    stats_t s = bench_random_churn_custom(ctx->cfg->ops, ctx->cfg->seed, ctx->scratch);
-    print_stats_row("my-malloc", &s);
-    csv_row("random_churn", "my-malloc", &s);
-    if (!ctx->cfg->skip_libc) {
-        stats_t sl = bench_random_churn_libc(ctx->cfg->ops, ctx->cfg->seed, ctx->scratch);
-        print_stats_row("glibc malloc", &sl);
-        csv_row("random_churn", "glibc", &sl);
+
+    unsigned warm_state = ctx->cfg->seed;
+    for (long i = 0; i < ctx->cfg->ops / 10; i++) {
+        void *p = my_malloc(rand_size(&warm_state));
+        escape(p);
+        my_free(p);
     }
+
+    random_ctx_t cctx = {.state = ctx->cfg->seed, .fail = 0};
+    stats_t s = run_batched(op_random_churn_custom, &cctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
+    print_stats_row("my-malloc", &s);
+    if (cctx.fail) fprintf(stderr, "  WARNING: my_malloc failed %ld/%ld times in this phase\n", cctx.fail, ctx->cfg->ops);
+    csv_row("random_churn", "my-malloc", &s, cctx.fail);
+
+    if (!ctx->cfg->skip_libc) {
+        warm_state = ctx->cfg->seed;
+        for (long i = 0; i < ctx->cfg->ops / 10; i++) {
+            void *p = malloc(rand_size(&warm_state));
+            escape(p);
+            free(p);
+        }
+        random_ctx_t lctx = {.state = ctx->cfg->seed, .fail = 0};
+        stats_t sl = run_batched(op_random_churn_libc, &lctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
+        print_stats_row("glibc malloc", &sl);
+        if (lctx.fail) fprintf(stderr, "  WARNING: glibc malloc failed %ld/%ld times in this phase\n", lctx.fail, ctx->cfg->ops);
+        csv_row("random_churn", "glibc", &sl, lctx.fail);
+    }
+
+    printf("  %-32s peak RSS so far: %ld KB\n", "", peak_rss_kb());
 }
 
 /* ------------------------------------------------------------------ */
@@ -432,36 +617,38 @@ static void phase_random_churn(phase_ctx_t *ctx)
 /* free everything at the end -- stresses list search / heap extension) */
 /* ------------------------------------------------------------------ */
 
-static stats_t bench_growth_custom(long ops, double *scratch)
+typedef struct { void **ptrs; long fail; } growth_ctx_t;
+
+static void op_growth_custom(void *vctx, long i)
 {
-    void **ptrs = malloc((size_t)ops * sizeof(void *));
-    if (!ptrs) { fprintf(stderr, "benchmark: OOM allocating bookkeeping array\n"); exit(1); }
-
-    double t0 = now_sec();
-    for (long i = 0; i < ops; i++) {
-        double s = now_sec();
-        ptrs[i] = my_malloc(32 + (size_t)(i % 64));
-        escape(ptrs[i]);
-        scratch[i] = (now_sec() - s) * 1e9;
-    }
-    double total = now_sec() - t0;
-
-    for (long i = 0; i < ops; i++) my_free(ptrs[i]);
-    free(ptrs);
-
-    return compute_stats(scratch, (size_t)ops, total);
+    growth_ctx_t *c = (growth_ctx_t *)vctx;
+    void *p = my_malloc(32 + (size_t)(i % 64));
+    escape(p);
+    if (!p) c->fail++;
+    c->ptrs[i] = p;
 }
 
 static void phase_growth_only(phase_ctx_t *ctx)
 {
     printf("\n-- Growth-only (allocate all, hold, free at the end) --\n");
+
+    void **ptrs = malloc((size_t)ctx->cfg->ops * sizeof(void *));
+    if (!ptrs) { fprintf(stderr, "benchmark: OOM allocating bookkeeping array\n"); exit(1); }
+
     void *before = sbrk_mark();
-    stats_t s = bench_growth_custom(ctx->cfg->ops, ctx->scratch);
+    growth_ctx_t gctx = {.ptrs = ptrs, .fail = 0};
+    stats_t s = run_batched(op_growth_custom, &gctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
     long grown = sbrk_delta_bytes(before);
+
     print_stats_row("my-malloc", &s);
     printf("  %-32s heap grew %ld bytes during this phase%s\n", "", grown,
            ctx->cfg->isolate ? " (cold start)" : " (heap shared with earlier phases)");
-    csv_row("growth_only", "my-malloc", &s);
+    if (gctx.fail) fprintf(stderr, "  WARNING: my_malloc failed %ld/%ld times in this phase\n", gctx.fail, ctx->cfg->ops);
+    printf("  %-32s peak RSS after growth: %ld KB\n", "", peak_rss_kb());
+    csv_row("growth_only", "my-malloc", &s, gctx.fail);
+
+    for (long i = 0; i < ctx->cfg->ops; i++) my_free(ptrs[i]);
+    free(ptrs);
 }
 
 /* ------------------------------------------------------------------ */
@@ -469,6 +656,8 @@ static void phase_growth_only(phase_ctx_t *ctx)
 /* alloc(small), alloc(large), ..., then free ALL the small ones,       */
 /* then try to allocate a big run -- a classic fragmentation stress     */
 /* pattern. We report heap growth (sbrk delta) as the overhead metric.  */
+/* This isn't a timed/batched phase (it's a one-shot measurement), but  */
+/* it now tracks allocation failures and peak RSS like every other one. */
 /* ------------------------------------------------------------------ */
 
 static void bench_fragmentation_custom(long pairs)
@@ -480,11 +669,13 @@ static void bench_fragmentation_custom(long pairs)
     if (!small || !large) { fprintf(stderr, "benchmark: OOM in fragmentation setup\n"); exit(1); }
 
     size_t requested_bytes = 0;
+    long fail = 0;
     for (long i = 0; i < pairs; i++) {
         small[i] = my_malloc(24);
         large[i] = my_malloc(512);
         escape(small[i]);
         escape(large[i]);
+        if (!small[i] || !large[i]) fail++;
         requested_bytes += 24 + 512;
     }
 
@@ -499,6 +690,7 @@ static void bench_fragmentation_custom(long pairs)
     for (long i = 0; i < big_ops; i++) {
         void *p = my_malloc(400);
         escape(p);
+        if (!p) fail++;
         requested_bytes += 400;
         my_free(p);
     }
@@ -512,9 +704,16 @@ static void bench_fragmentation_custom(long pairs)
 
     printf("  %-32s heap grew %8ld bytes for %8zu bytes requested  (%+.1f%% overhead)\n",
            "fragmentation pattern (custom)", grown, requested_bytes, overhead_pct);
+    if (fail) fprintf(stderr, "  WARNING: %ld allocation(s) failed during the fragmentation phase\n", fail);
+    printf("  %-32s peak RSS after fragmentation: %ld KB\n", "", peak_rss_kb());
 
+    /* This phase's shape (a single heap-growth measurement, not a
+     * timed series) doesn't fit the main timing CSV schema, so it gets
+     * its own comment-prefixed line instead of forcing a column-count
+     * match with rows that mean something different. */
     if (g_csv) {
-        fprintf(g_csv, "fragmentation,my-malloc,%ld,,,,,,,\n", grown);
+        fprintf(g_csv, "# fragmentation: heap_grown_bytes=%ld requested_bytes=%zu alloc_failures=%ld\n",
+                grown, requested_bytes, fail);
     }
 
     free(small);
@@ -532,74 +731,72 @@ static void phase_fragmentation(phase_ctx_t *ctx)
 /* Workload 5: realloc-heavy (simulates a growing dynamic array/buffer) */
 /* ------------------------------------------------------------------ */
 
-static stats_t bench_realloc_growth_custom(long ops, double *scratch)
-{
-    void *p = my_malloc(16);
-    escape(p);
-    size_t cur = 16;
+typedef struct { void *p; size_t cur; long fail; } realloc_ctx_t;
 
-    double t0 = now_sec();
-    for (long i = 0; i < ops; i++) {
-        size_t next = cur + 8 + (size_t)(i % 32);
-        double s = now_sec();
-        void *np = my_realloc(p, next);
-        if (!np) { fprintf(stderr, "benchmark: my_realloc failed at op %ld\n", i); exit(1); }
-        p = np;
-        cur = next;
-        escape(p);
-        scratch[i] = (now_sec() - s) * 1e9;
-        if (cur > 1u << 20) { /* periodically reset so we don't grow unboundedly */
-            my_free(p);
-            p = my_malloc(16);
-            cur = 16;
-        }
+static void op_realloc_growth_custom(void *vctx, long i)
+{
+    realloc_ctx_t *c = (realloc_ctx_t *)vctx;
+    size_t next = c->cur + 8 + (size_t)(i % 32);
+    void *np = my_realloc(c->p, next);
+    if (!np) { c->fail++; return; }
+    c->p = np;
+    c->cur = next;
+    escape(c->p);
+    if (c->cur > (1u << 20)) { /* periodically reset so we don't grow unboundedly */
+        my_free(c->p);
+        c->p = my_malloc(16);
+        c->cur = 16;
     }
-    double total = now_sec() - t0;
-    my_free(p);
-    return compute_stats(scratch, (size_t)ops, total);
 }
 
-static stats_t bench_realloc_growth_libc(long ops, double *scratch)
+static void op_realloc_growth_libc(void *vctx, long i)
 {
-    void *p = malloc(16);
-    escape(p);
-    size_t cur = 16;
-
-    double t0 = now_sec();
-    for (long i = 0; i < ops; i++) {
-        size_t next = cur + 8 + (size_t)(i % 32);
-        double s = now_sec();
-        void *np = realloc(p, next);
-        if (!np) { fprintf(stderr, "benchmark: realloc failed at op %ld\n", i); exit(1); }
-        p = np;
-        cur = next;
-        escape(p);
-        scratch[i] = (now_sec() - s) * 1e9;
-        if (cur > 1u << 20) {
-            free(p);
-            p = malloc(16);
-            cur = 16;
-        }
+    realloc_ctx_t *c = (realloc_ctx_t *)vctx;
+    size_t next = c->cur + 8 + (size_t)(i % 32);
+    void *np = realloc(c->p, next);
+    if (!np) { c->fail++; return; }
+    c->p = np;
+    c->cur = next;
+    escape(c->p);
+    if (c->cur > (1u << 20)) {
+        free(c->p);
+        c->p = malloc(16);
+        c->cur = 16;
     }
-    double total = now_sec() - t0;
-    free(p);
-    return compute_stats(scratch, (size_t)ops, total);
 }
 
 static void phase_realloc_growth(phase_ctx_t *ctx)
 {
     printf("\n-- Realloc-heavy growth pattern --\n");
-    stats_t s = bench_realloc_growth_custom(ctx->cfg->ops, ctx->scratch);
-    print_stats_row("my-malloc", &s);
-    csv_row("realloc_growth", "my-malloc", &s);
-    if (!ctx->cfg->skip_libc) {
-        stats_t sl = bench_realloc_growth_libc(ctx->cfg->ops, ctx->scratch);
-        print_stats_row("glibc realloc", &sl);
-        csv_row("realloc_growth", "glibc", &sl);
-    }
-}
 
-/* ------------------------------------------------------------------ */
+    realloc_ctx_t cctx = {.p = my_malloc(16), .cur = 16, .fail = 0};
+    escape(cctx.p);
+    if (!cctx.p) {
+        fprintf(stderr, "benchmark: initial my_malloc(16) failed, skipping this phase\n");
+        return;
+    }
+    stats_t s = run_batched(op_realloc_growth_custom, &cctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
+    my_free(cctx.p);
+    print_stats_row("my-malloc", &s);
+    if (cctx.fail) fprintf(stderr, "  WARNING: my_realloc failed %ld/%ld times in this phase\n", cctx.fail, ctx->cfg->ops);
+    csv_row("realloc_growth", "my-malloc", &s, cctx.fail);
+
+    if (!ctx->cfg->skip_libc) {
+        realloc_ctx_t lctx = {.p = malloc(16), .cur = 16, .fail = 0};
+        escape(lctx.p);
+        if (!lctx.p) {
+            fprintf(stderr, "benchmark: initial malloc(16) failed, skipping glibc side of this phase\n");
+        } else {
+            stats_t sl = run_batched(op_realloc_growth_libc, &lctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
+            free(lctx.p);
+            print_stats_row("glibc realloc", &sl);
+            if (lctx.fail) fprintf(stderr, "  WARNING: glibc realloc failed %ld/%ld times in this phase\n", lctx.fail, ctx->cfg->ops);
+            csv_row("realloc_growth", "glibc", &sl, lctx.fail);
+        }
+    }
+
+    printf("  %-32s peak RSS so far: %ld KB\n", "", peak_rss_kb());
+}
 
 /* ------------------------------------------------------------------ */
 /* Phase registry -- add new phases here, nowhere else.                 */
@@ -639,13 +836,22 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Calibrated once in the parent -- this measures the timer itself,
+     * not the allocator, so it's safe to compute before any fork() and
+     * share the result with every child via the copied phase_ctx_t. */
+    clock_info_t clk = calibrate_clock();
+
     printf("my-malloc benchmark suite\n");
     printf("  ops per phase : %ld\n", cfg.ops);
     printf("  seed          : %u  (reuse with --seed %u to reproduce)\n", cfg.seed, cfg.seed);
     printf("  libc compare  : %s\n", cfg.skip_libc ? "disabled" : "enabled");
     printf("  phase mode    : %s\n", cfg.isolate
-           ? "isolated (each phase in its own fresh subprocess, cold heap)"
+           ? "isolated (each phase in its own fresh subprocess, cold heap, pinned to CPU 0)"
            : "shared (one heap across all phases, --shared was passed)");
+    printf("  timer         : overhead=%.1fns/call-pair  resolution=%.1fns\n",
+           clk.overhead_ns, clk.res_ns);
+    printf("                  (see [batch=.. samples=..] on each row -- batching keeps\n");
+    printf("                  the timer's own cost negligible relative to what's measured)\n");
     printf("  ALIGN=%zu  HEADER_SIZE=%zu  FOOTER_SIZE=%zu  MIN_FREE_BLOCK=%zu  CHUNK_SIZE=%d\n",
            (size_t)ALIGN, (size_t)HEADER_SIZE, (size_t)FOOTER_SIZE, (size_t)MIN_FREE_BLOCK, CHUNK_SIZE);
 
@@ -654,11 +860,13 @@ int main(int argc, char **argv)
 
     if (!cfg.isolate) {
         /* Shared mode: the one process that runs every phase owns the
-         * one and only heap_init() call, exactly like the old behavior. */
+         * one and only heap_init() call, exactly like the old behavior.
+         * Pin it once here since there's no per-phase fork to pin inside. */
+        pin_to_cpu0();
         heap_init();
     }
 
-    phase_ctx_t ctx = {.cfg = &cfg, .scratch = scratch};
+    phase_ctx_t ctx = {.cfg = &cfg, .scratch = scratch, .clock = clk};
 
     size_t num_phases = sizeof(phases) / sizeof(phases[0]);
     for (size_t i = 0; i < num_phases; i++) {

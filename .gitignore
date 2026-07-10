@@ -6,7 +6,9 @@ cmake-build-*/
 
 # Binary
 my-malloc
-
+test-basic
+test-edge-cases
+benchmark
 # Object files
 *.o
 

@@ -54,10 +54,11 @@ typedef struct Block
 
 // function prototypes
 void heap_init(void);
-Block *find_suitable_block(size_t requestSize);
+Block *find_suitable_block(size_t request_size);
 Block *request_block(size_t size);
-Block *split(Block *block, size_t requestPayload);
+Block *split(Block *block, size_t request_payload);
 Block *coalesce(Block *curr);
+Block* try_expand(Block *curr, size_t new_payload);
 
 void my_free(void *ptr);
 void set_footer(Block *block);
@@ -65,6 +66,6 @@ void *my_malloc(size_t size);
 void *my_realloc(void *ptr, size_t size);
 void *my_calloc(size_t num, size_t size);
 
-bool try_expand(Block *curr, size_t newPayload);
+
 
 #endif // MY_MALLOC_H

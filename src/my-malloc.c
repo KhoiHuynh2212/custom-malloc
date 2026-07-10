@@ -164,7 +164,7 @@ void set_footer(Block *block)
 
 void *my_malloc(size_t size)
 {
-    Block *block;
+    Block *curr_block;
 
     if (size == 0 || size >= __SIZE_MAX__ - (ALIGN - 1))
     {
@@ -187,58 +187,58 @@ void *my_malloc(size_t size)
             return NULL;
         }
 
-        block = (Block *)ptr;
-        block->free = 0;
-        SET_ALLOCATED(block);
-        SET_MMAP(block);
-        block->payload = total_page_up - HEADER_SIZE - FOOTER_SIZE;
-        set_footer(block);
+        curr_block = (Block *)ptr;
+        curr_block->free = 0;
+        SET_ALLOCATED(curr_block);
+        SET_MMAP(curr_block);
+        curr_block->payload = total_page_up - HEADER_SIZE - FOOTER_SIZE;
+        set_footer(curr_block);
     }
     else
     {
 
-        block = find_suitable_block(request_size);
+        curr_block = find_suitable_block(request_size);
 
-        if (block == NULL)
+        if (curr_block == NULL)
         {
 
-            block = request_block(request_size);
+            curr_block = request_block(request_size);
 
-            if (block == NULL)
+            if (curr_block == NULL)
             {
                 return NULL;
             }
 
-            if (block->payload >= request_size + MIN_FREE_BLOCK)
+            if (curr_block->payload >= request_size + MIN_FREE_BLOCK)
             {
-                block = split(block, request_size);
-                return block + 1;
+                curr_block = split(curr_block, request_size);
+                return curr_block + 1;
             }
             else
             {
 
-                SET_ALLOCATED(block);
-                SET_SBRK(block);
-                return block + 1;
+                SET_ALLOCATED(curr_block);
+                SET_SBRK(curr_block);
+                return curr_block + 1;
             }
         }
 
-        if (block->payload >= request_size + MIN_FREE_BLOCK)
+        if (curr_block->payload >= request_size + MIN_FREE_BLOCK)
         {
-            block = split(block, request_size);
-            return block + 1;
+            curr_block = split(curr_block, request_size);
+            return curr_block + 1;
         }
 
-        if (rover == &block->list)
+        if (rover == &curr_block->list)
         {
             rover = &head.list;
         }
 
-        list_unlink(&block->list); // only unlink if it came from free list
-        SET_ALLOCATED(block);      // mark as allocated (clear free bit)
-        SET_SBRK(block);           // mark as sbrk'd (clear mmap bit)
+        list_unlink(&curr_block->list); // only unlink if it came from free list
+        SET_ALLOCATED(curr_block);      // mark as allocated (clear free bit)
+        SET_SBRK(curr_block);           // mark as sbrk'd (clear mmap bit)
     }
-    return block + 1;
+    return curr_block + 1;
 }
 
 void *my_calloc(size_t num, size_t size)
@@ -258,32 +258,85 @@ void *my_calloc(size_t num, size_t size)
     return ptr;
 }
 
-bool try_expand(Block *curr, size_t newPayload)
+Block *try_expand(Block *curr, size_t new_payload)
 {
     Block *next = BLOCK_NEXT_HEADER(curr, curr->payload);
 
-    if ((char *)next >= (char *)heap_end)
-        return false;
+    int next_free = ((char *)next < (char *)heap_end && IS_FREE(next));
 
-    if (!IS_FREE(next))
-        return false;
+    size_t next_gains = next_free ? (next->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
 
-    size_t merge_size = next->payload + curr->payload + HEADER_SIZE + FOOTER_SIZE;
-    if (merge_size < newPayload)
-    {
-        return false;
-    }
-    else
+    if (next_free && (curr->payload + next_gains >= new_payload))
     {
         if (rover == &next->list)
         {
             rover = &head.list;
         }
-        curr->payload = merge_size;
-        set_footer(curr);
+
+        curr->payload += next->payload + HEADER_SIZE + FOOTER_SIZE;
         list_unlink(&next->list);
-        return true;
+        set_footer(curr);
+        return curr;
     }
+
+    size_t *footer = (size_t *)((char *)curr - FOOTER_SIZE);
+
+    int prev_free = ((char *)footer >= (char *)heap_start);
+
+    Block *prev = prev_free ? BLOCK_PREV_HEADER(curr, *footer) : NULL;
+
+    prev_free = (prev_free && (char *)prev >= (char *)heap_start && IS_FREE(prev));
+
+    size_t prev_gains = prev_free ? (prev->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
+
+    if (prev_free && (curr->payload + prev_gains >= new_payload))
+    {
+        if (rover == &prev->list)
+        {
+            rover = &head.list;
+        }
+
+        prev->payload += HEADER_SIZE + FOOTER_SIZE + curr->payload;
+        prev->free = 0;
+        SET_ALLOCATED(prev);
+        SET_SBRK(prev);
+        set_footer(prev);
+
+        void *dest = (void *)(prev + 1);
+
+        const void *src = (void *)(curr + 1);
+
+        if (curr->payload > 0)
+        {
+            memmove(dest, src, curr->payload);
+        }
+
+        list_unlink(&prev->list); // remove from free list
+
+        return prev;
+    }
+
+    if (next_free && prev_free && (curr->payload + prev_gains + next_gains >= new_payload))
+    {
+
+        if (rover == &next->list || rover == &prev->list)
+            rover = &head.list;
+        list_unlink(&next->list);
+        list_unlink(&prev->list);
+
+        prev->payload += curr->payload + next_gains + HEADER_SIZE + FOOTER_SIZE;
+        prev->free = 0;
+        SET_ALLOCATED(prev);
+        SET_SBRK(prev);
+        set_footer(prev);
+
+        if (curr->payload > 0)
+            memmove(prev + 1, curr + 1, curr->payload);
+
+        return prev;
+    }
+
+    return NULL;
 }
 
 void *my_realloc(void *ptr, size_t size)
@@ -300,51 +353,54 @@ void *my_realloc(void *ptr, size_t size)
         return NULL;
     }
 
-    size_t new_payload = ALIGN_UP(size);
-    Block *block = (Block *)ptr - 1;
+    size_t request_size = ALIGN_UP(size);
+    Block *current_block = (Block *)ptr - 1;
 
-    if (rover == &block->list)
-    {
-        rover = &head.list;
-    }
 
-    if (!IS_MMAP(block))
+    if (!IS_MMAP(current_block))
     {
 
-        if (new_payload <= block->payload)
+        if (request_size <= current_block->payload)
         {
-            if (block->payload >= new_payload + MIN_FREE_BLOCK)
-                split(block, new_payload);
+            if (current_block->payload >= request_size + MIN_FREE_BLOCK)
+                split(current_block, request_size);
 
             return ptr;
         }
 
-        if (new_payload < MMAP_THRESHOLD && try_expand(block, new_payload))
+        // if current block is not fit but the request size is smaller than MMAP_THRESHOLD
+        if (request_size < MMAP_THRESHOLD)
         {
-            if (block->payload >= new_payload + MIN_FREE_BLOCK)
-                split(block, new_payload);
+            Block *surv = try_expand(current_block, request_size);
 
-            return ptr;
+            if (surv != NULL)
+            {
+                if (surv->payload >= request_size + MIN_FREE_BLOCK)
+                    split(surv, request_size); // split survivor block
+
+                return surv + 1; // try_expand may move the data to previous address, to ensure we return correct address of the data, use block + 1
+            }
         }
 
-        Block *next_block = BLOCK_NEXT_HEADER(block, block->payload);
+        Block *next_block = BLOCK_NEXT_HEADER(current_block, current_block->payload);
 
         if ((char *)next_block == (char *)heap_end)
         {
 
-            size_t shortfall = new_payload - block->payload;
-            size_t allocated_size = (shortfall < CHUNK_SIZE) ? CHUNK_SIZE : shortfall;
+            size_t buffered = current_block->payload + current_block->payload;
+            size_t new_payload = (buffered > request_size) ? buffered : request_size;
+            size_t allocated_size = new_payload - current_block->payload;
 
             // automatically extend the program break and update its heap and payload
             void *request = sbrk(allocated_size);
             if (request != (void *)-1)
             {
-                block->payload += allocated_size;
-                set_footer(block);
+                current_block->payload += allocated_size;
+                set_footer(current_block);
                 heap_end += allocated_size;
 
-                if (block->payload >= new_payload + MIN_FREE_BLOCK)
-                    split(block, new_payload);
+                if (current_block->payload >= request_size + MIN_FREE_BLOCK)
+                    split(current_block, request_size);
                 return ptr;
             }
         }
@@ -352,13 +408,13 @@ void *my_realloc(void *ptr, size_t size)
     else
     {
 
-        if (new_payload <= block->payload)
+        if (request_size <= current_block->payload)
         {
             return ptr;
         }
 
         void *new_loc;
-        new_loc = mremap(block, block->payload + ALIGN_HEADER_FOOTER, new_payload + ALIGN_HEADER_FOOTER, MREMAP_MAYMOVE);
+        new_loc = mremap(current_block, current_block->payload + ALIGN_HEADER_FOOTER, request_size + ALIGN_HEADER_FOOTER, MREMAP_MAYMOVE);
         if (new_loc == MAP_FAILED)
         {
             perror("mremap");
@@ -366,7 +422,7 @@ void *my_realloc(void *ptr, size_t size)
         }
 
         Block *nb = (Block *)new_loc;
-        nb->payload = new_payload;
+        nb->payload = request_size;
         set_footer(nb);
 
         return nb + 1;
@@ -377,9 +433,9 @@ void *my_realloc(void *ptr, size_t size)
         return NULL;
 
     size_t copySize =
-        (block->payload < new_payload)
-            ? block->payload
-            : new_payload;
+        (current_block->payload < request_size)
+            ? current_block->payload
+            : request_size;
 
     memcpy(new_ptr, ptr, copySize);
     my_free(ptr);

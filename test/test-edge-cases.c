@@ -484,6 +484,193 @@ static void test_realloc_forced_relocation(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Edge case: try_expand in-place growth (forward / backward / 3-way)  */
+/*                                                                      */
+/* These target try_expand() specifically -- the realloc-time sibling  */
+/* of coalesce() that can relocate the block via memmove() when it     */
+/* merges backward. Correctness here hinges on getting the merged      */
+/* block's address, its list membership, and every byte of moved data  */
+/* right -- a bug in any of those is silent corruption, not a crash.   */
+/* ------------------------------------------------------------------ */
+
+static void test_try_expand_forward_only(void)
+{
+    SECTION("try_expand: forward-only merge grows in place, no data move");
+
+    void *a = my_malloc(64);
+    void *b = my_malloc(64);
+    void *c = my_malloc(64);
+    CHECK(a && b && c, "three adjacent allocations succeed");
+
+    fill_pattern(b, 64, 0x11);
+
+    my_free(c); /* c becomes free, adjacent to b's forward side */
+
+    void *b2 = my_realloc(b, 64 + 64 + HEADER_SIZE + FOOTER_SIZE - 8);
+    CHECK(b2 != NULL, "realloc requesting a b+c-sized region succeeds");
+    CHECK(b2 == b, "forward-only merge does not relocate the block");
+    CHECK(check_pattern(b2, 64, 0x11), "original bytes preserved (no move needed)");
+    CHECK(!list_is_linked(&hdr_of(b2)->list),
+          "merged block is allocated -- not sitting on the free list");
+
+    my_free(a);
+    my_free(b2);
+}
+
+static void test_try_expand_backward_only(void)
+{
+    SECTION("try_expand: backward-only merge relocates via memmove, data intact");
+
+    /* SZ is deliberately bigger than HEADER_SIZE + FOOTER_SIZE, so the
+     * memmove's source and destination ranges genuinely overlap -- this
+     * is the exact scenario that requires memmove() instead of memcpy(),
+     * since memcpy() on overlapping regions is undefined behavior. */
+    enum { SZ = 256 };
+
+    void *a = my_malloc(SZ);
+    void *b = my_malloc(SZ);
+    void *c = my_malloc(SZ); /* blocks b's forward neighbor, so only the
+                                 backward path under test can fire */
+    CHECK(a && b && c, "three adjacent allocations succeed");
+
+    unsigned char *bytes = b;
+    for (size_t i = 0; i < SZ; i++) bytes[i] = (unsigned char)(i * 7 + 3);
+
+    my_free(a); /* a becomes free, adjacent to b's backward side */
+
+    void *b2 = my_realloc(b, SZ + SZ + HEADER_SIZE + FOOTER_SIZE - 8);
+    CHECK(b2 != NULL, "realloc requesting an a+b-sized region succeeds");
+    CHECK(b2 == a, "backward-only merge relocates to the absorbed block's address");
+
+    int intact = 1;
+    for (size_t i = 0; i < SZ; i++) {
+        if (((unsigned char *)b2)[i] != (unsigned char)(i * 7 + 3)) { intact = 0; break; }
+    }
+    CHECK(intact, "every byte of the original payload survives the memmove, "
+                  "including the region that overlapped with the old header");
+
+    CHECK(!list_is_linked(&hdr_of(b2)->list),
+          "absorbed-and-grown block is allocated -- not on the free list");
+    CHECK(!IS_FREE(hdr_of(b2)), "merged block's free bit is cleared");
+
+    size_t *footer = (size_t *)((char *)(hdr_of(b2) + 1) + hdr_of(b2)->payload);
+    CHECK(*footer == hdr_of(b2)->payload,
+          "footer matches payload after backward merge (metadata self-consistent)");
+
+    my_free(b2);
+    my_free(c);
+}
+
+static void test_try_expand_three_way(void)
+{
+    SECTION("try_expand: three-way merge (prev+curr+next) relocates correctly");
+
+    void *a = my_malloc(48);
+    void *b = my_malloc(48);
+    void *c = my_malloc(48);
+    void *d = my_malloc(48); /* trailing blocker bounds the region */
+    CHECK(a && b && c && d, "four adjacent allocations succeed");
+
+    fill_pattern(b, 48, 0x5A);
+
+    my_free(a); /* isolated free block behind b */
+    my_free(c); /* isolated free block ahead of b */
+
+    void *big = my_realloc(b, 48 * 3 + HEADER_SIZE * 2 + FOOTER_SIZE * 2 - 8);
+    CHECK(big != NULL, "realloc requesting the full a+b+c region succeeds");
+    CHECK(big == a, "three-way merge relocates to the leftmost absorbed block");
+    CHECK(check_pattern(big, 48, 0x5A), "original bytes preserved through the three-way merge");
+    CHECK(!list_is_linked(&hdr_of(big)->list), "merged block is allocated -- not on the free list");
+
+    my_free(big);
+    my_free(d);
+}
+
+static void test_try_expand_split_after_merge(void)
+{
+    SECTION("try_expand: leftover after a merge gets split back into the free list");
+
+    void *a = my_malloc(64);
+    void *b = my_malloc(64);
+    void *c = my_malloc(64);
+    CHECK(a && b && c, "three adjacent allocations succeed");
+
+    fill_pattern(b, 64, 0x99);
+    my_free(c); /* free neighbor, far bigger than what we'll actually request */
+
+    /* Ask for only slightly more than b's original size. The forward
+     * merge finds much more space than needed, so the remainder should
+     * be split back out into a reusable free block, not folded wastefully
+     * into b2's payload. */
+    void *b2 = my_realloc(b, 64 + ALIGN);
+    CHECK(b2 == b, "small growth still expands in place via forward merge");
+    CHECK(check_pattern(b2, 64, 0x99), "original bytes preserved");
+    CHECK(hdr_of(b2)->payload < 64 + 64 + HEADER_SIZE + FOOTER_SIZE,
+          "leftover space was split off, not left folded into b2's payload");
+
+    void *reuse = my_malloc(ALIGN);
+    CHECK(reuse != NULL, "split-off remainder is available for a fresh allocation");
+
+    my_free(a);
+    my_free(b2);
+    my_free(reuse);
+}
+
+static void test_try_expand_insufficient_falls_back(void)
+{
+    SECTION("try_expand: merge that still wouldn't fit correctly declines");
+
+    void *a = my_malloc(64);
+    void *b = my_malloc(64);
+    void *c = my_malloc(64);
+    void *d = my_malloc(64); /* trailing blocker */
+    CHECK(a && b && c && d, "four adjacent allocations succeed");
+
+    fill_pattern(b, 64, 0x33);
+    my_free(a);
+    my_free(c); /* both neighbors free, but nowhere near enough combined --
+                    try_expand must report "not enough", not hand back an
+                    undersized block */
+
+    void *big = my_realloc(b, 8192);
+    CHECK(big != NULL, "realloc for a size far beyond any local merge still succeeds "
+                        "(falls back to malloc+copy+free)");
+    CHECK(check_pattern(big, 64, 0x33), "original bytes preserved through the fallback path");
+
+    my_free(big);
+    my_free(d);
+}
+
+static void test_try_expand_no_prev_at_heap_start(void)
+{
+    SECTION("try_expand: no out-of-bounds read when there is no previous block");
+
+    /* This runs as the first allocator call in its own forked child, which
+     * inherits the heap exactly as heap_init() left it -- so this malloc
+     * carves off the very start of the initial free block, meaning the
+     * returned block sits at heap_start with nothing behind it. The
+     * backward-merge check in try_expand walks to (char*)curr - FOOTER_SIZE
+     * to read a footer that, for this block, does not exist; it must be
+     * guarded by the heap_start comparison rather than assumed safe.
+     * Build this binary with -fsanitize=address for a hard guarantee this
+     * isn't quietly reading before the mapped region. */
+    void *p = my_malloc(64);
+    void *guard = my_malloc(64); /* blocks the forward path too, so only the
+                                     backward boundary check is exercised */
+    CHECK(p && guard, "first two allocations of the heap succeed");
+
+    fill_pattern(p, 64, 0x7A);
+
+    void *p2 = my_realloc(p, 64 + 64 + HEADER_SIZE + FOOTER_SIZE - 8);
+    CHECK(p2 != NULL, "realloc succeeds even though no merge is possible "
+                       "(no block exists before heap_start, next is allocated)");
+    CHECK(check_pattern(p2, 64, 0x7A), "original bytes preserved regardless of path taken");
+
+    my_free(p2);
+    my_free(guard);
+}
+
+/* ------------------------------------------------------------------ */
 /* Edge case: canary / guard bytes survive unrelated allocator churn    */
 /* ------------------------------------------------------------------ */
 
@@ -609,6 +796,19 @@ static void test_fuzz_mixed_ops_seeded(unsigned seed)
     CHECK(!corruption_found, "no data corruption across 2000 randomized ops");
     CHECK(op_failures == 0, "no unexpected allocation failures during fuzz run");
 
+    /* Design invariant: allocated blocks are never linked into the free
+     * list. If try_expand() or split() ever forgets to unlink an absorbed
+     * or trimmed block, this is what catches it -- corruption_found above
+     * only catches bad *data*, this catches bad *metadata*. */
+    int invariant_ok = 1;
+    for (int i = 0; i < SLOTS; i++) {
+        if (slots[i].live && list_is_linked(&hdr_of(slots[i].ptr)->list)) {
+            invariant_ok = 0;
+        }
+    }
+    CHECK(invariant_ok, "every live allocation is off the free list "
+                        "(allocated-never-on-list invariant holds)");
+
     for (int i = 0; i < SLOTS; i++) {
         if (slots[i].live) my_free(slots[i].ptr);
     }
@@ -646,6 +846,12 @@ static const TestCase tests[] = {
     {"large allocation extends heap",        test_large_allocation_extends_heap},
     {"many extensions stay consistent",      test_many_extensions_stay_consistent},
     {"realloc forced relocation",            test_realloc_forced_relocation},
+    {"try_expand forward-only merge",        test_try_expand_forward_only},
+    {"try_expand backward-only merge",       test_try_expand_backward_only},
+    {"try_expand three-way merge",           test_try_expand_three_way},
+    {"try_expand split after merge",         test_try_expand_split_after_merge},
+    {"try_expand insufficient merge falls back", test_try_expand_insufficient_falls_back},
+    {"try_expand no-prev heap-start boundary", test_try_expand_no_prev_at_heap_start},
     {"canary survival",                      test_canary_survival},
     {"fuzz: mixed ops",                      test_fuzz_mixed_ops},
 };
