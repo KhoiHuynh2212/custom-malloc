@@ -16,4 +16,6 @@ benchmark
 *.dSYM
 
 # Temporary
-*.swp
+*.swp 
+
+*.csv

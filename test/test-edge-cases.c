@@ -1,15 +1,6 @@
 /*
  * test-edge-cases.c - edge case / robustness suite for my-malloc
- *
- * Build:
- *   gcc -Wall -Wextra -std=c11 -Iinclude -g \
- *       -o test/test-edge-cases src/my-malloc.c test/test-edge-cases.c
- *
- * Build with sanitizers (safe to use, allocator no longer shadows libc's
- * malloc/calloc/realloc/free symbol names):
- *   gcc -Wall -Wextra -std=c11 -Iinclude -fsanitize=address,undefined -g \
- *       -o test/test-edge-cases src/my-malloc.c test/test-edge-cases.c
- *
+ 
  * Run:
  *   ./test/test-edge-cases            (normal output)
  *   ./test/test-edge-cases -v         (verbose: prints internal block state)
@@ -42,13 +33,6 @@
  *    reproduced exactly by re-running with the same seed.
  *  - Structured pass/fail accounting + non-zero exit code on failure, so
  *    this is CI-friendly (`make test && echo ok`).
- *
- * NOTE ON NAMING: this file calls my_malloc/my_calloc/my_realloc/my_free
- * exclusively -- never the plain malloc/calloc/realloc/free -- since
- * those are now genuinely distinct functions (no symbol shadowing).
- * Bookkeeping arrays in this file (test slot arrays, etc.) intentionally
- * use plain libc malloc/free so the test harness itself doesn't
- * interact with the allocator under test.
  */
 
 #include "my-malloc.h"
@@ -715,6 +699,177 @@ static void test_canary_survival(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Boundary: heap shrinkage must never retreat past the starting break */
+/* ------------------------------------------------------------------ */
+
+static void test_heap_shrink_boundary(void)
+{
+    SECTION("heap shrinkage never retreats past the starting program break");
+
+    /* heap_init() only runs once, in main(), before any test is forked.
+     * Every test child inherits that already-established break, so
+     * sbrk(0) right here IS "the initial starting heap address" -- the
+     * floor sbrk must never dip below, no matter how aggressively free()
+     * tries to give memory back to the OS.
+     *
+     * Important: heap_init() itself already reserves one full
+     * MMAP_THRESHOLD-sized free block via a single sbrk() call. Small
+     * allocations (a few KB) are satisfied entirely out of that reserve
+     * and never touch sbrk again -- so to actually force *new* growth
+     * past the floor, requests need to exceed that initial free
+     * capacity in aggregate. Each individual request is kept just under
+     * MMAP_THRESHOLD so it stays on the sbrk path instead of mmap. */
+    void *heap_floor = sbrk(0);
+
+    enum { N = 3 };
+    void *ptrs[N];
+    int all_ok = 1;
+    size_t big = MMAP_THRESHOLD - CHUNK_SIZE;
+
+    for (int i = 0; i < N; i++) {
+        ptrs[i] = my_malloc(big);
+        if (!ptrs[i]) all_ok = 0;
+    }
+    CHECK(all_ok, "three large (MMAP_THRESHOLD - CHUNK_SIZE) allocations succeed, "
+                  "exceeding heap_init()'s initial reserve and forcing new sbrk growth");
+
+    void *heap_grown = sbrk(0);
+    CHECK(heap_grown > heap_floor,
+          "heap actually grew past the floor (sanity check: the test is exercising growth)");
+
+    /* Free everything. The last free() of a big trailing block is the
+     * one most likely to trigger a give-back-to-the-OS shrink -- that's
+     * exactly the path that can over-subtract and walk the break past
+     * where the arena actually started. */
+    for (int i = 0; i < N; i++) {
+        my_free(ptrs[i]);
+    }
+
+    void *heap_final = sbrk(0);
+    CHECK(heap_final >= heap_floor,
+          "program break after full shrinkage never dips below the starting heap address");
+
+    vlog("heap_floor=%p heap_grown=%p heap_final=%p", heap_floor, heap_grown, heap_final);
+}
+
+/* ------------------------------------------------------------------ */
+/* Threshold transition: MMAP_THRESHOLD routes to mmap, not sbrk       */
+/* ------------------------------------------------------------------ */
+
+static void test_mmap_threshold_transitions(void)
+{
+    SECTION("MMAP_THRESHOLD boundary routes to mmap, and resizing tracks it");
+
+    /* One alignment step under threshold: must stay on the sbrk/heap
+     * arena. Note this is MMAP_THRESHOLD - ALIGN, not - 1: the size is
+     * ALIGN_UP()'d *before* the mmap-threshold check runs, and
+     * MMAP_THRESHOLD is itself a multiple of ALIGN, so anything in
+     * (MMAP_THRESHOLD - ALIGN, MMAP_THRESHOLD) rounds up and crosses
+     * into the mmap branch anyway. */
+    void *below = my_malloc(MMAP_THRESHOLD - ALIGN);
+    CHECK(below != NULL, "allocation just under MMAP_THRESHOLD succeeds");
+    CHECK(!IS_MMAP(hdr_of(below)),
+          "size just under MMAP_THRESHOLD is served from the sbrk heap, not mmap");
+
+    /* Exactly at threshold: this is the documented cutover point. */
+    void *at = my_malloc(MMAP_THRESHOLD);
+    CHECK(at != NULL, "allocation of exactly MMAP_THRESHOLD succeeds");
+    CHECK(IS_MMAP(hdr_of(at)), "size == MMAP_THRESHOLD is routed to mmap");
+    CHECK(is_aligned(at), "mmap'd payload is still correctly aligned");
+
+    fill_pattern(at, MMAP_THRESHOLD, 0x3C);
+
+    /* Grow further: a correct implementation should extend the existing
+     * mapping (mremap) rather than silently falling back to a fresh
+     * sbrk block + copy, so the block should still read as mmap'd. */
+    void *grown = my_realloc(at, MMAP_THRESHOLD * 2);
+    CHECK(grown != NULL, "growing an mmap'd block succeeds");
+    CHECK(IS_MMAP(hdr_of(grown)),
+          "growing an already-mmap'd block keeps it mmap-backed (mremap path)");
+    CHECK(check_pattern(grown, MMAP_THRESHOLD, 0x3C),
+          "original bytes survive the grow-resize");
+
+    /* Shrink back under the threshold. Whether your implementation
+     * munmaps and hands back a fresh sbrk block here, or just keeps the
+     * mapping via mremap regardless of size, is a real design choice --
+     * pick whichever your allocator does and tighten the CHECK below to
+     * match (e.g. CHECK(!IS_MMAP(hdr_of(shrunk)), ...) if you munmap). */
+    void *shrunk = my_realloc(grown, 64);
+    CHECK(shrunk != NULL, "shrinking an mmap'd block down succeeds");
+    CHECK(check_pattern(shrunk, 64, 0x3C), "surviving bytes preserved through the shrink");
+
+    my_free(below);
+    my_free(shrunk);
+}
+
+/* ------------------------------------------------------------------ */
+/* Structural poisoning: footer size must always match header payload  */
+/* ------------------------------------------------------------------ */
+
+/* Reads the boundary-tag footer that sits right after a block's payload
+ * (see BLOCK_NEXT_HEADER in my-malloc.h: header | payload | footer |
+ * next-header). If split()/coalesce() ever update the header's payload
+ * without rewriting the matching footer, this is what catches it -- a
+ * stale footer is exactly what makes backward coalescing walk into the
+ * wrong place next time a neighbor is freed. */
+static size_t block_footer_value(Block *b)
+{
+    return *(size_t *)((char *)(b + 1) + b->payload);
+}
+
+static void test_footer_payload_consistency(void)
+{
+    SECTION("footer sizes match header payloads (boundary tag correctness)");
+
+    enum { N = 6 };
+    static const size_t sizes[N] = {8, 40, 128, 500, 1024, 3000};
+    void *ptrs[N];
+
+    int footers_ok = 1;
+    for (int i = 0; i < N; i++) {
+        ptrs[i] = my_malloc(sizes[i]);
+        if (!ptrs[i]) { footers_ok = 0; continue; }
+        Block *b = hdr_of(ptrs[i]);
+        size_t footer = block_footer_value(b);
+        if (footer != b->payload) footers_ok = 0;
+        vlog("requested=%zu payload=%zu footer=%zu", sizes[i], b->payload, footer);
+    }
+    CHECK(footers_ok,
+          "footer size_t immediately after each payload equals that block's header->payload");
+
+    /* Free a couple of interior blocks, which forces split/coalesce to
+     * rewrite footers -- confirm the footer still tracks the (possibly
+     * merged) payload afterward, not a stale pre-merge value. */
+    my_free(ptrs[1]);
+    my_free(ptrs[3]);
+
+    Block *survivor = hdr_of(ptrs[2]);
+    CHECK(survivor->payload == sizes[2],
+          "untouched neighbor block's payload is unaffected by neighboring frees");
+
+    int list_ok = 1;
+    for (int i = 0; i < N; i++) {
+        if (i == 1 || i == 3) continue;
+        if (list_is_linked(&hdr_of(ptrs[i])->list)) list_ok = 0; /* allocated => never on free list */
+    }
+    CHECK(list_ok, "remaining allocated blocks are not linked into the free list after neighbor frees");
+
+    /* Direct doubly-linked-list symmetry check on a freed node: this is
+     * the structural half of "structural poisoning" -- next->prev and
+     * prev->next must both point back to the node itself. */
+    void *fp = my_malloc(64);
+    my_free(fp);
+    Block *fb = hdr_of(fp);
+    CHECK(fb->list.next->prev == &fb->list && fb->list.prev->next == &fb->list,
+          "freed block's list node is symmetrically linked in both directions");
+
+    for (int i = 0; i < N; i++) {
+        if (i == 1 || i == 3) continue;
+        my_free(ptrs[i]);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Fuzz-style stress test with checksummed data and mixed operations   */
 /* ------------------------------------------------------------------ */
 
@@ -853,6 +1008,9 @@ static const TestCase tests[] = {
     {"try_expand insufficient merge falls back", test_try_expand_insufficient_falls_back},
     {"try_expand no-prev heap-start boundary", test_try_expand_no_prev_at_heap_start},
     {"canary survival",                      test_canary_survival},
+    {"heap shrink boundary",                 test_heap_shrink_boundary},
+    {"mmap threshold transitions",           test_mmap_threshold_transitions},
+    {"footer/payload consistency",           test_footer_payload_consistency},
     {"fuzz: mixed ops",                      test_fuzz_mixed_ops},
 };
 

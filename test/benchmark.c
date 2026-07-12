@@ -799,6 +799,231 @@ static void phase_realloc_growth(phase_ctx_t *ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/* Workload 6: generational thrashing -- long-lived survivors scattered */
+/* among short-lived nursery churn, stressing the rover's next-fit walk */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Simulates a generational-GC-style access pattern: most allocations in
+ * each "generation" die immediately (nursery churn), but a small,
+ * randomly-sized fraction gets "promoted" and held alive across every
+ * later generation. Those survivors sit scattered through the heap
+ * permanently, blocking coalescing around them and forcing
+ * find_suitable_block's rover to walk past more and more dead-end free
+ * blocks as generations accumulate.
+ *
+ * We can't read the `rover` pointer directly -- it's static inside
+ * my-malloc.c, invisible from here. So this measures its cost
+ * indirectly instead of assuming it: the op performed (my_malloc of a
+ * random small size) is IDENTICAL in every generation. If per-
+ * generation latency trends upward anyway, that extra time is coming
+ * from somewhere inside the allocator's search, not from this
+ * benchmark doing more work. A flat trend means the rover holds up
+ * fine under this pattern; a climbing one means it doesn't.
+ */
+
+typedef struct {
+    void **survivors;
+    long survivor_count;
+    long survivor_cap;
+    unsigned state;
+    long fail;
+} thrash_ctx_t;
+
+static void op_generational_thrash(void *vctx, long i)
+{
+    (void)i;
+    thrash_ctx_t *c = (thrash_ctx_t *)vctx;
+    size_t sz = rand_size(&c->state); /* reuses the 1..2048 helper from Workload 2 */
+    void *p = my_malloc(sz);
+    escape(p);
+    if (!p) { c->fail++; return; }
+
+    /* ~3% promotion rate: rare enough that survivors accumulate slowly
+     * and realistically, common enough to matter over hundreds of
+     * generations. */
+    if ((rand_r(&c->state) % 100) < 3 && c->survivor_count < c->survivor_cap) {
+        c->survivors[c->survivor_count++] = p;
+    } else {
+        my_free(p);
+    }
+}
+
+static void phase_generational_thrash(phase_ctx_t *ctx)
+{
+    printf("\n-- Generational thrashing (long-lived survivors fragment the rover's walk) --\n");
+
+    enum { GENERATIONS = 200 };
+    long ops_per_gen = ctx->cfg->ops / GENERATIONS;
+    if (ops_per_gen < 32) ops_per_gen = 32; /* keep each generation big enough to time meaningfully */
+
+    long survivor_cap = GENERATIONS * (ops_per_gen / 20 + 1); /* generous bound at ~5% worst case */
+    void **survivors = malloc(sizeof(void *) * (size_t)survivor_cap);
+    double *gen_avg_ns = malloc(sizeof(double) * GENERATIONS);
+    if (!survivors || !gen_avg_ns) {
+        fprintf(stderr, "benchmark: OOM allocating generational-thrash bookkeeping\n");
+        exit(1);
+    }
+
+    thrash_ctx_t tctx = {.survivors = survivors, .survivor_count = 0,
+                          .survivor_cap = survivor_cap, .state = ctx->cfg->seed, .fail = 0};
+
+    /* This intentionally does NOT use run_batched(): that function
+     * returns one aggregate stats_t for the whole run, but the entire
+     * point here is the *trend across generations*, so each generation
+     * is timed as its own interval and kept as a separate sample in the
+     * series (see gen_avg_ns[]) instead of being folded into one mean. */
+    for (int g = 0; g < GENERATIONS; g++) {
+        double t0 = now_sec();
+        for (long i = 0; i < ops_per_gen; i++) {
+            op_generational_thrash(&tctx, i);
+        }
+        double elapsed = now_sec() - t0;
+        gen_avg_ns[g] = (elapsed / (double)ops_per_gen) * 1e9;
+
+        /* One CSV comment-row per generation -- not part of the main
+         * timing schema (see the fragmentation phase for the same
+         * convention), but exactly the series you'd pull into a
+         * spreadsheet to plot the degradation curve over time. */
+        if (g_csv) {
+            fprintf(g_csv, "# generational_thrash gen=%d avg_ns=%.2f survivors_alive=%ld\n",
+                    g, gen_avg_ns[g], tctx.survivor_count);
+        }
+    }
+
+    /* Compare the first 10% of generations (heap still mostly clean)
+     * against the last 10% (heap thoroughly scattered with survivors).
+     * That ratio IS the traversal degradation this phase exists to
+     * catch. */
+    int window = GENERATIONS / 10 > 0 ? GENERATIONS / 10 : 1;
+    double early_sum = 0, late_sum = 0;
+    for (int g = 0; g < window; g++) early_sum += gen_avg_ns[g];
+    for (int g = GENERATIONS - window; g < GENERATIONS; g++) late_sum += gen_avg_ns[g];
+    double early_avg = early_sum / window;
+    double late_avg = late_sum / window;
+    double degradation_x = early_avg > 0 ? late_avg / early_avg : 0;
+
+    double worst_ns = gen_avg_ns[0];
+    int worst_gen = 0;
+    for (int g = 1; g < GENERATIONS; g++) {
+        if (gen_avg_ns[g] > worst_ns) { worst_ns = gen_avg_ns[g]; worst_gen = g; }
+    }
+
+    printf("  %-32s %ld survivors alive by the end, %d generations x %ld ops each\n",
+           "generational thrash", tctx.survivor_count, (int)GENERATIONS, ops_per_gen);
+    printf("  %-32s early (gen 0-%d) avg=%.1fns  late (gen %d-%d) avg=%.1fns  degradation=%.2fx\n",
+           "", window - 1, early_avg, GENERATIONS - window, GENERATIONS - 1, late_avg, degradation_x);
+    printf("  %-32s worst single generation: gen=%d avg=%.1fns (%.2fx early baseline)\n",
+           "", worst_gen, worst_ns, early_avg > 0 ? worst_ns / early_avg : 0);
+    if (tctx.fail) fprintf(stderr, "  WARNING: my_malloc failed %ld times during generational thrash\n", tctx.fail);
+    if (g_csv) {
+        fprintf(g_csv, "# generational_thrash_summary early_avg_ns=%.2f late_avg_ns=%.2f "
+                        "degradation_x=%.2f worst_gen=%d worst_ns=%.2f\n",
+                early_avg, late_avg, degradation_x, worst_gen, worst_ns);
+    }
+    printf("  %-32s peak RSS after generational thrash: %ld KB\n", "", peak_rss_kb());
+
+    for (long i = 0; i < tctx.survivor_count; i++) my_free(tctx.survivors[i]);
+    free(survivors);
+    free(gen_avg_ns);
+}
+
+/* ------------------------------------------------------------------ */
+/* Workload 7: fragmentation & packing utilization                     */
+/* bytes the user actually asked for vs bytes the allocator asked the  */
+/* OS for via sbrk -- a direct measure of how well split()/coalesce()  */
+/* reuse freed holes for later, differently-sized requests instead of  */
+/* just growing the heap every time.                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    void **live;
+    long live_count;
+    long live_cap;
+    unsigned state;
+    size_t requested_bytes;
+    long fail;
+} packing_ctx_t;
+
+static void op_packing_utilization(void *vctx, long i)
+{
+    (void)i;
+    packing_ctx_t *c = (packing_ctx_t *)vctx;
+
+    /* ~60% of the time, free a random already-live block first -- this
+     * is what creates holes of assorted sizes for the *next*
+     * allocation to (ideally) reuse, rather than the heap simply
+     * growing forever. A realistic long-running-process pattern, not
+     * the alternating small/large swiss-cheese shape the existing
+     * `fragmentation` phase already covers. */
+    if (c->live_count > 0 && (rand_r(&c->state) % 100) < 60) {
+        long idx = (long)(rand_r(&c->state) % (unsigned)c->live_count);
+        my_free(c->live[idx]);
+        c->live[idx] = c->live[--c->live_count];
+    }
+
+    size_t sz = rand_size(&c->state);
+    void *p = my_malloc(sz);
+    escape(p);
+    if (!p) { c->fail++; return; }
+    c->requested_bytes += sz;
+
+    if (c->live_count < c->live_cap) {
+        c->live[c->live_count++] = p;
+    } else {
+        /* bookkeeping array is full -- hold it forever rather than
+         * lose the pointer, which would be a real leak, not a
+         * benchmark artifact. */
+        my_free(p);
+        c->requested_bytes -= sz;
+    }
+}
+
+static void phase_packing_utilization(phase_ctx_t *ctx)
+{
+    printf("\n-- Fragmentation & packing utilization (requested vs sbrk'd bytes) --\n");
+
+    long cap = ctx->cfg->ops;
+    void **live = malloc(sizeof(void *) * (size_t)cap);
+    if (!live) { fprintf(stderr, "benchmark: OOM allocating packing bookkeeping array\n"); exit(1); }
+
+    void *before = sbrk_mark();
+    packing_ctx_t pctx = {.live = live, .live_count = 0, .live_cap = cap,
+                           .state = ctx->cfg->seed, .requested_bytes = 0, .fail = 0};
+
+    stats_t s = run_batched(op_packing_utilization, &pctx, ctx->cfg->ops, ctx->scratch, ctx->clock.overhead_ns);
+    long grown = sbrk_delta_bytes(before);
+
+    print_stats_row("my-malloc", &s);
+    if (grown > 0) {
+        double packing_pct = 100.0 * (double)pctx.requested_bytes / (double)grown;
+        double overhead_pct = 100.0 * ((double)grown - (double)pctx.requested_bytes) / (double)grown;
+        printf("  %-32s requested=%8zu bytes  heap grew=%8ld bytes  packing=%.1f%%  overhead=%.1f%%\n",
+               "", pctx.requested_bytes, grown, packing_pct, overhead_pct);
+        if (g_csv) {
+            fprintf(g_csv, "# packing_utilization requested_bytes=%zu heap_grown_bytes=%ld "
+                            "packing_pct=%.2f overhead_pct=%.2f\n",
+                    pctx.requested_bytes, grown, packing_pct, overhead_pct);
+        }
+    } else {
+        printf("  %-32s requested=%8zu bytes  heap grew=%8ld bytes  "
+               "(fully absorbed by heap_init()'s initial reserve -- nothing to compute overhead against)\n",
+               "", pctx.requested_bytes, grown);
+        if (g_csv) {
+            fprintf(g_csv, "# packing_utilization requested_bytes=%zu heap_grown_bytes=%ld "
+                            "packing_pct=NA overhead_pct=NA\n",
+                    pctx.requested_bytes, grown);
+        }
+    }
+    if (pctx.fail) fprintf(stderr, "  WARNING: my_malloc failed %ld/%ld times in this phase\n", pctx.fail, ctx->cfg->ops);
+    printf("  %-32s peak RSS after packing test: %ld KB\n", "", peak_rss_kb());
+    csv_row("packing_utilization", "my-malloc", &s, pctx.fail);
+
+    for (long i = 0; i < pctx.live_count; i++) my_free(pctx.live[i]);
+    free(live);
+}
+
+/* ------------------------------------------------------------------ */
 /* Phase registry -- add new phases here, nowhere else.                 */
 /*                                                                       */
 /* Same idea as the TestCase registry in test-basic.c/test-edge-       */
@@ -815,11 +1040,13 @@ typedef struct {
 } PhaseCase;
 
 static const PhaseCase phases[] = {
-    {"fixed_churn",      phase_fixed_churn},
-    {"random_churn",     phase_random_churn},
-    {"growth_only",      phase_growth_only},
-    {"fragmentation",    phase_fragmentation},
-    {"realloc_growth",   phase_realloc_growth},
+    {"fixed_churn",           phase_fixed_churn},
+    {"random_churn",          phase_random_churn},
+    {"growth_only",           phase_growth_only},
+    {"fragmentation",         phase_fragmentation},
+    {"realloc_growth",        phase_realloc_growth},
+    {"generational_thrash",   phase_generational_thrash},
+    {"packing_utilization",   phase_packing_utilization},
 };
 
 int main(int argc, char **argv)

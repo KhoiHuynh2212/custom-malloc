@@ -61,7 +61,15 @@ Block *coalesce(Block *curr);
 Block* try_expand(Block *curr, size_t new_payload);
 
 void my_free(void *ptr);
-void set_footer(Block *block);
+
+static inline void set_footer(Block *block)
+{
+    size_t *footer =
+        (size_t *)((char *)(block + 1) + block->payload);
+
+    *footer = block->payload;
+    assert(*footer == block->payload);
+}
 void *my_malloc(size_t size);
 void *my_realloc(void *ptr, size_t size);
 void *my_calloc(size_t num, size_t size);

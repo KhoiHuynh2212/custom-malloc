@@ -153,14 +153,7 @@ Block *coalesce(Block *curr)
     }
     return curr;
 }
-void set_footer(Block *block)
-{
-    size_t *footer =
-        (size_t *)((char *)(block + 1) + block->payload);
 
-    *footer = block->payload;
-    assert(*footer == block->payload);
-}
 
 void *my_malloc(size_t size)
 {
