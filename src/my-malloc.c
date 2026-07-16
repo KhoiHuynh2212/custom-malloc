@@ -11,20 +11,29 @@ static bool initialized = false;
 
 static list *rover = &head.list;
 
+pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void heap_init()
 {
-
+    pthread_mutex_lock(&global_lock);
     if (initialized)
+    {
+
+        pthread_mutex_unlock(&global_lock);
         return;
+    }
+    
 
     void *start = sbrk(MMAP_THRESHOLD);
 
     if (start == (void *)-1)
-    {
+    {   
+        pthread_mutex_unlock(&global_lock); 
         return;
     }
 
     initialized = true;
+    pthread_mutex_unlock(&global_lock);
 
     heap_start = start;
     heap_end = start + MMAP_THRESHOLD;
@@ -34,8 +43,10 @@ void heap_init()
 
     first->payload = raw_payload & ~(ALIGN - 1);
     first->free = 0;
+
     set_footer(first);
     SET_FREE(first);
+
     list_init(&first->list);
     list_add_after(&head.list, &first->list);
 }
@@ -154,10 +165,10 @@ Block *coalesce(Block *curr)
     return curr;
 }
 
-
 void *my_malloc(size_t size)
 {
     Block *curr_block;
+    int s;
 
     if (size == 0 || size >= __SIZE_MAX__ - (ALIGN - 1))
     {
@@ -176,7 +187,8 @@ void *my_malloc(size_t size)
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
         if (ptr == MAP_FAILED)
-        {
+        {   
+            
             return NULL;
         }
 
@@ -190,6 +202,13 @@ void *my_malloc(size_t size)
     else
     {
 
+        s = pthread_mutex_lock(&global_lock);
+
+        if (s != 0)
+        {
+            fprintf(stderr, "pthread_mutex_lock failed\n");
+        }
+
         curr_block = find_suitable_block(request_size);
 
         if (curr_block == NULL)
@@ -198,20 +217,37 @@ void *my_malloc(size_t size)
             curr_block = request_block(request_size);
 
             if (curr_block == NULL)
-            {
+            {   
+                pthread_mutex_unlock(&global_lock);
                 return NULL;
             }
 
             if (curr_block->payload >= request_size + MIN_FREE_BLOCK)
             {
                 curr_block = split(curr_block, request_size);
+
+                s = pthread_mutex_unlock(&global_lock);
+                if (s != 0)
+                {
+                    fprintf(stderr, "pthread_mutex_unlock failed\n");
+                }
+
                 return curr_block + 1;
             }
+
             else
             {
+                // TARGET SCENARIO: The block is big enough, but too small to split!
 
                 SET_ALLOCATED(curr_block);
                 SET_SBRK(curr_block);
+
+                s = pthread_mutex_unlock(&global_lock);
+
+                if (s != 0)
+                {
+                    fprintf(stderr, "pthread_mutex_unlock failed\n");
+                }
                 return curr_block + 1;
             }
         }
@@ -219,6 +255,13 @@ void *my_malloc(size_t size)
         if (curr_block->payload >= request_size + MIN_FREE_BLOCK)
         {
             curr_block = split(curr_block, request_size);
+
+            s = pthread_mutex_unlock(&global_lock);
+
+            if (s != 0)
+            {
+                fprintf(stderr, "pthread_mutex_unlock failed\n");
+            }
             return curr_block + 1;
         }
 
@@ -230,12 +273,21 @@ void *my_malloc(size_t size)
         list_unlink(&curr_block->list); // only unlink if it came from free list
         SET_ALLOCATED(curr_block);      // mark as allocated (clear free bit)
         SET_SBRK(curr_block);           // mark as sbrk'd (clear mmap bit)
+
+        s = pthread_mutex_unlock(&global_lock);
+
+        if (s != 0)
+        {
+            fprintf(stderr, "pthread_mutex_unlock failed\n");
+        }
     }
+
     return curr_block + 1;
 }
 
 void *my_calloc(size_t num, size_t size)
 {
+
     if (num != 0 && size > __SIZE_MAX__ / num)
     {
         return NULL;
@@ -248,6 +300,7 @@ void *my_calloc(size_t num, size_t size)
     }
 
     memset(ptr, 0, num * size);
+    
     return ptr;
 }
 
@@ -349,15 +402,17 @@ void *my_realloc(void *ptr, size_t size)
     size_t request_size = ALIGN_UP(size);
     Block *current_block = (Block *)ptr - 1;
 
-
     if (!IS_MMAP(current_block))
     {
+        int s = pthread_mutex_lock(&global_lock);
+        if (s != 0) fprintf(stderr, "pthread_mutex_lock failed\n");
 
         if (request_size <= current_block->payload)
         {
             if (current_block->payload >= request_size + MIN_FREE_BLOCK)
                 split(current_block, request_size);
 
+            pthread_mutex_unlock(&global_lock);
             return ptr;
         }
 
@@ -371,6 +426,7 @@ void *my_realloc(void *ptr, size_t size)
                 if (surv->payload >= request_size + MIN_FREE_BLOCK)
                     split(surv, request_size); // split survivor block
 
+                pthread_mutex_unlock(&global_lock);
                 return surv + 1; // try_expand may move the data to previous address, to ensure we return correct address of the data, use block + 1
             }
         }
@@ -394,9 +450,12 @@ void *my_realloc(void *ptr, size_t size)
 
                 if (current_block->payload >= request_size + MIN_FREE_BLOCK)
                     split(current_block, request_size);
+
+                pthread_mutex_unlock(&global_lock);
                 return ptr;
             }
         }
+        pthread_mutex_unlock(&global_lock);
     }
     else
     {
@@ -441,7 +500,7 @@ void my_free(void *ptr)
     if (ptr == NULL)
         return;
     Block *block = (Block *)ptr - 1;
-
+    int s;
     if (IS_FREE(block))
     {
         fprintf(stderr, "double free detected at %p\n", ptr);
@@ -454,7 +513,9 @@ void my_free(void *ptr)
         munmap(block, ALIGN_HEADER_FOOTER + block->payload);
     }
     else
-    {
+    {   
+        s = pthread_mutex_lock(&global_lock);
+        if (s != 0) fprintf(stderr, "pthread_mutex_lock failed\n");
         SET_FREE(block);
         set_footer(block);
         Block *survivor = coalesce(block);
@@ -492,7 +553,11 @@ void my_free(void *ptr)
 
                 heap_end = (char *)new_break;
                 sbrk(-(intptr_t)actual_shrink_amt);
-            }
+            } 
+
         }
     }
+
+    s = pthread_mutex_unlock(&global_lock);
+    if (s != 0) fprintf(stderr, "pthread_mutex_unlock failed\n");
 }
