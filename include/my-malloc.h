@@ -15,9 +15,8 @@
 #define ALIGN _Alignof(max_align_t)
 #define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
 #define MIN_FREE_BLOCK (HEADER_SIZE + FOOTER_SIZE + ALIGN)
-#define SHRINK_KEEP 2048 
-#define CHUNK_SIZE 4096
-
+#define CHUNK_SIZE 64 * 1024 // 64 KB
+#define SHRINK_KEEP (CHUNK_SIZE / 4) 
 #define LINUX_PAGE sysconf(_SC_PAGESIZE)
 
 #define FREE_BIT      (1 << 0)   // bit 0: 1 = free, 0 = allocated
@@ -45,7 +44,7 @@ typedef struct Block
 
 #define ALIGN_HEADER_FOOTER ALIGN_UP(HEADER_SIZE + FOOTER_SIZE)
 #define MMAP_THRESHOLD 128 * 1024 // 128 KB
-#define SHRINK_THRESHOLD (12 * 1024)  // 12KB
+#define SHRINK_THRESHOLD (CHUNK_SIZE * 2)  // 12 KB
 #define BLOCK_NEXT_HEADER(curr, payload) \
     ((Block *)((char *)((curr) + 1) + (payload) + FOOTER_SIZE))
 

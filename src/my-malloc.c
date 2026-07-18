@@ -59,7 +59,7 @@ Block *find_suitable_block(size_t requestSize)
         return NULL;
     }
 
-    list *curr = rover->next;
+    list *curr = rover;
 
     if (curr == &head.list)
         curr = curr->next;
@@ -71,7 +71,6 @@ Block *find_suitable_block(size_t requestSize)
         Block *block = list_entry(curr, Block, list);
         if (block->payload >= requestSize)
         {
-            rover = curr;
             return block;
         }
         curr = curr->next;
@@ -118,7 +117,7 @@ Block *split(Block *block, size_t requestPayload)
 
     if (rover == &block->list)
     {
-        rover = &head.list;
+        rover = block->list.next;
     }
     // block get trimmed and given to the caller
     block->payload = requestPayload;
@@ -138,7 +137,7 @@ Block *coalesce(Block *curr)
     {
         if (rover == &next_block->list)
         {
-            rover = &head.list;
+            rover = next_block->list.next;
         }
         curr->payload += HEADER_SIZE + next_block->payload + FOOTER_SIZE;
         set_footer(curr);
@@ -152,11 +151,9 @@ Block *coalesce(Block *curr)
         Block *prev_block = BLOCK_PREV_HEADER(curr, (*footer));
 
         if ((char *)prev_block >= (char *)heap_start && IS_FREE(prev_block))
-        {
-            if (rover == &prev_block->list)
-            {
-                rover = &head.list;
-            }
+        {   
+            if (rover == &prev_block->list) rover = prev_block->list.next;
+
             prev_block->payload += HEADER_SIZE + FOOTER_SIZE + curr->payload;
             set_footer(prev_block);
             return prev_block;
@@ -238,7 +235,7 @@ void *my_malloc(size_t size)
             else
             {
                 // TARGET SCENARIO: The block is big enough, but too small to split!
-
+                // never reach this branch possible 
                 SET_ALLOCATED(curr_block);
                 SET_SBRK(curr_block);
 
@@ -267,7 +264,7 @@ void *my_malloc(size_t size)
 
         if (rover == &curr_block->list)
         {
-            rover = &head.list;
+            rover = curr_block->list.next;
         }
 
         list_unlink(&curr_block->list); // only unlink if it came from free list
@@ -306,22 +303,23 @@ void *my_calloc(size_t num, size_t size)
 
 Block *try_expand(Block *curr, size_t new_payload)
 {
-    Block *next = BLOCK_NEXT_HEADER(curr, curr->payload);
+    Block *next_phys_block = BLOCK_NEXT_HEADER(curr, curr->payload);
 
-    int next_free = ((char *)next < (char *)heap_end && IS_FREE(next));
+    int next_phys_is_free = ((char *)next_phys_block < (char *)heap_end && IS_FREE(next_phys_block));
 
-    size_t next_gains = next_free ? (next->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
+    size_t next_gains = next_phys_is_free ? (next_phys_block->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
 
-    if (next_free && (curr->payload + next_gains >= new_payload))
+    if (next_phys_is_free && (curr->payload + next_gains >= new_payload))
     {
-        if (rover == &next->list)
-        {
-            rover = &head.list;
+      
+        if (rover == &next_phys_block->list) {
+            rover = next_phys_block->list.next;
         }
-
-        curr->payload += next->payload + HEADER_SIZE + FOOTER_SIZE;
-        list_unlink(&next->list);
+        
+        curr->payload += next_phys_block->payload + HEADER_SIZE + FOOTER_SIZE;
+        list_unlink(&next_phys_block->list);
         set_footer(curr);
+
         return curr;
     }
 
@@ -329,26 +327,26 @@ Block *try_expand(Block *curr, size_t new_payload)
 
     int prev_free = ((char *)footer >= (char *)heap_start);
 
-    Block *prev = prev_free ? BLOCK_PREV_HEADER(curr, *footer) : NULL;
+    Block *prev_phys_block = prev_free ? BLOCK_PREV_HEADER(curr, *footer) : NULL;
 
-    prev_free = (prev_free && (char *)prev >= (char *)heap_start && IS_FREE(prev));
+    prev_free = (prev_free && (char *)prev_phys_block >= (char *)heap_start && IS_FREE(prev_phys_block));
 
-    size_t prev_gains = prev_free ? (prev->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
+    size_t prev_gains = prev_free ? (prev_phys_block->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
 
     if (prev_free && (curr->payload + prev_gains >= new_payload))
     {
-        if (rover == &prev->list)
+        if (rover == &prev_phys_block->list)
         {
-            rover = &head.list;
+            rover = prev_phys_block->list.next;
         }
 
-        prev->payload += HEADER_SIZE + FOOTER_SIZE + curr->payload;
-        prev->free = 0;
-        SET_ALLOCATED(prev);
-        SET_SBRK(prev);
-        set_footer(prev);
+        prev_phys_block->payload += HEADER_SIZE + FOOTER_SIZE + curr->payload;
+        prev_phys_block->free = 0;
+        SET_ALLOCATED(prev_phys_block);
+        SET_SBRK(prev_phys_block);
+        set_footer(prev_phys_block);
 
-        void *dest = (void *)(prev + 1);
+        void *dest = (void *)(prev_phys_block + 1);
 
         const void *src = (void *)(curr + 1);
 
@@ -357,29 +355,32 @@ Block *try_expand(Block *curr, size_t new_payload)
             memmove(dest, src, curr->payload);
         }
 
-        list_unlink(&prev->list); // remove from free list
+        list_unlink(&prev_phys_block->list); // remove from free list
 
-        return prev;
+        return prev_phys_block;
     }
 
-    if (next_free && prev_free && (curr->payload + prev_gains + next_gains >= new_payload))
+    if (next_phys_is_free && prev_free && (curr->payload + prev_gains + next_gains >= new_payload))
     {
 
-        if (rover == &next->list || rover == &prev->list)
-            rover = &head.list;
-        list_unlink(&next->list);
-        list_unlink(&prev->list);
+        if (rover == &next_phys_block->list)
+            rover = next_phys_block->list.next;  
+        list_unlink(&next_phys_block->list);
 
-        prev->payload += curr->payload + next_gains + HEADER_SIZE + FOOTER_SIZE;
-        prev->free = 0;
-        SET_ALLOCATED(prev);
-        SET_SBRK(prev);
-        set_footer(prev);
+        if (rover == &prev_phys_block->list)
+            rover = prev_phys_block->list.next;   
+        list_unlink(&prev_phys_block->list);
+        
+        prev_phys_block->payload += curr->payload + next_gains + HEADER_SIZE + FOOTER_SIZE;
+        prev_phys_block->free = 0;
+        SET_ALLOCATED(prev_phys_block);
+        SET_SBRK(prev_phys_block);
+        set_footer(prev_phys_block);
 
         if (curr->payload > 0)
-            memmove(prev + 1, curr + 1, curr->payload);
+            memmove(prev_phys_block + 1, curr + 1, curr->payload);
 
-        return prev;
+        return prev_phys_block;
     }
 
     return NULL;
@@ -406,7 +407,8 @@ void *my_realloc(void *ptr, size_t size)
     {
         int s = pthread_mutex_lock(&global_lock);
         if (s != 0) fprintf(stderr, "pthread_mutex_lock failed\n");
-
+        
+        // resize to smaller size, cut off and split the block
         if (request_size <= current_block->payload)
         {
             if (current_block->payload >= request_size + MIN_FREE_BLOCK)
@@ -427,7 +429,8 @@ void *my_realloc(void *ptr, size_t size)
                     split(surv, request_size); // split survivor block
 
                 pthread_mutex_unlock(&global_lock);
-                return surv + 1; // try_expand may move the data to previous address, to ensure we return correct address of the data, use block + 1
+                return surv + 1; 
+                // try_expand may move the data to previous address, to ensure we return correct address of the data, use block + 1
             }
         }
 
@@ -541,7 +544,7 @@ void my_free(void *ptr)
             {
                 if (rover == &survivor->list)
                 {
-                    rover = &head.list;
+                    rover = survivor->list.next;
                 }
 
                 list_unlink(&survivor->list);
@@ -556,8 +559,8 @@ void my_free(void *ptr)
             } 
 
         }
+        s = pthread_mutex_unlock(&global_lock);
+        if (s != 0) fprintf(stderr, "pthread_mutex_unlock failed\n");
     }
 
-    s = pthread_mutex_unlock(&global_lock);
-    if (s != 0) fprintf(stderr, "pthread_mutex_unlock failed\n");
 }

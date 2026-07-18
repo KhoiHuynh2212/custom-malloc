@@ -147,6 +147,94 @@ static int is_aligned(const void *ptr)
     return ((uintptr_t)ptr % ALIGN) == 0;
 }
 
+/* watchdog_arm/disarm - guard against an internal infinite loop.
+ *
+ * A corrupted free list (e.g. a stale rover pointing into memory that
+ * got coalesced out from under it) is exactly as likely to manifest as
+ * a hang inside find_suitable_block()'s do/while as it is a crash. Since
+ * each test already runs inside its own forked child (see main()), a
+ * hang there would otherwise wedge that child forever with no crash for
+ * waitpid() to report -- the parent would just block. Arm a short alarm
+ * before any operation suspected of being able to loop forever; the
+ * handler _exit()s so the outer fork/waitpid harness still sees a clean
+ * (nonzero-status) failure instead of a stuck test run.
+ */
+static void watchdog_fired(int signo)
+{
+    (void)signo;
+    const char msg[] = "\n  [FAIL] watchdog: operation did not return -- suspected infinite loop\n";
+    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+}
+
+static void watchdog_arm(unsigned seconds)
+{
+    signal(SIGALRM, watchdog_fired);
+    alarm(seconds);
+}
+
+static void watchdog_disarm(void)
+{
+    alarm(0);
+}
+
+/*
+ * walk_free_ring_from - traverse the circular free list starting from a
+ * node known to currently be free, and validate every node visited.
+ *
+ * The list is circular and includes the private sentinel `head`, which
+ * this test file has no direct pointer to -- but since the ring is
+ * circular, starting from *any* live node and following ->next until we
+ * arrive back at that same node necessarily visits the sentinel plus
+ * every free block, without needing access to `head` itself.
+ *
+ * This exists to directly probe the concern that a merge (coalesce() or
+ * try_expand()'s three-way path) could leave a stale/ghost list node
+ * behind -- e.g. curr's old header memory still linked into the ring
+ * after its bytes became part of the merged payload. A ghost node would
+ * show up here as: an entry that isn't actually free (free bit clear,
+ * since real payload bytes would rarely coincidentally set it), a
+ * next/prev pair that isn't symmetric, or a ring that never returns to
+ * the start (infinite loop, caught by the visited-count cap below).
+ *
+ * Returns the number of free blocks visited (excluding the sentinel), or
+ * -1 if the ring is asymmetric or doesn't close within a generous cap.
+ */
+static int walk_free_ring_from(list *start)
+{
+    enum { MAX_NODES = 100000 }; /* generous cap -- a real cycle should be far smaller */
+    int free_count = 0;
+    list *node = start;
+    int steps = 0;
+
+    do {
+        if (node->next->prev != node || node->prev->next != node) {
+            return -1; /* asymmetric link: corruption */
+        }
+
+        /* Distinguish the sentinel (payload == 0, never marked free) from
+         * a real free block by reinterpreting the node as a Block, which
+         * is valid because every list node in this allocator is always
+         * embedded inside a Block. */
+        Block *b = list_entry(node, Block, list);
+        if (!(b->payload == 0 && !IS_FREE(b))) {
+            if (!IS_FREE(b)) {
+                return -1; /* a non-free, non-sentinel node is on the free ring */
+            }
+            free_count++;
+        }
+
+        node = node->next;
+        steps++;
+    } while (node != start && steps < MAX_NODES);
+
+    if (node != start) {
+        return -1; /* never closed the ring -- corruption or true infinite structure */
+    }
+
+    return free_count;
+}
+
 /* Fill a buffer with a repeating byte pattern derived from a seed. */
 static void fill_pattern(unsigned char *buf, size_t n, unsigned char seed)
 {
@@ -979,6 +1067,153 @@ static void test_fuzz_mixed_ops(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Edge case: three-way merge must not leave a ghost/stale list node    */
+/* ------------------------------------------------------------------ */
+
+static void test_try_expand_three_way_no_ghost_node(void)
+{
+    SECTION("try_expand three-way merge: no stale list node survives the merge");
+
+    /* Same a/b/c/d shape as test_try_expand_three_way(), but here we
+     * additionally walk the *entire* free ring afterward. The specific
+     * worry: try_expand()'s three-way path unlinks prev and next, folds
+     * curr's bytes into prev via memmove, and returns prev -- if curr's
+     * old header (now interior payload bytes of the merged block) were
+     * ever left registered in the ring instead of being cleanly
+     * subsumed, or if prev/next's unlink left a dangling pointer, this
+     * would catch it as an asymmetric link, a "free" bit on a block that
+     * is actually allocated, or a ring that never closes. */
+    void *a = my_malloc(48);
+    void *b = my_malloc(48);
+    void *c = my_malloc(48);
+    void *d = my_malloc(48); /* trailing blocker bounds the region */
+    void *e = my_malloc(48); /* stays free the whole time: seeds the ring walk */
+    CHECK(a && b && c && d && e, "five adjacent allocations succeed");
+
+    fill_pattern(b, 48, 0x5A);
+
+    my_free(e); /* known-free anchor to start the ring walk from */
+    my_free(a); /* isolated free block behind b */
+    my_free(c); /* isolated free block ahead of b */
+
+    watchdog_arm(5);
+    void *big = my_realloc(b, 48 * 3 + HEADER_SIZE * 2 + FOOTER_SIZE * 2 - 8);
+    watchdog_disarm();
+
+    CHECK(big != NULL, "realloc requesting the full a+b+c region succeeds");
+    CHECK(big == a, "three-way merge relocates to the leftmost absorbed block");
+    CHECK(check_pattern(big, 48, 0x5A), "original bytes preserved through the three-way merge");
+    CHECK(!list_is_linked(&hdr_of(big)->list), "merged block is allocated -- not on the free list");
+
+    watchdog_arm(5);
+    int ring_count = walk_free_ring_from(&hdr_of(e)->list);
+    watchdog_disarm();
+
+    CHECK(ring_count == 1,
+          "free ring contains exactly the one still-free block ('e') -- "
+          "no ghost node left behind by the merge, no lost/duplicated entries");
+    vlog("free ring visited %d free block(s) after three-way merge", ring_count);
+
+    my_free(big);
+    my_free(d); /* 'd' is adjacent to 'e' and forward-coalesces with it here --
+                   'e' must NOT be freed again after this */
+}
+
+/* ------------------------------------------------------------------ */
+/* Edge case: freeing the block the internal rover is aimed at, then    */
+/* immediately allocating, must not corrupt or hang the free list       */
+/* ------------------------------------------------------------------ */
+
+static void test_rover_survives_adjacent_free(void)
+{
+    SECTION("rover: freeing next to the scan cursor then reallocating stays consistent");
+
+    /* `rover` (my-malloc.c) is a next-fit cursor into the free list.
+     * find_suitable_block() points it at whatever block it just matched,
+     * and every consumer of that match (split(), the full-reuse path in
+     * my_malloc(), coalesce(), try_expand()) resets it back to &head.list
+     * if it's about to remove/merge the exact node rover references --
+     * so by inspection rover should never survive a call pointing at a
+     * block that gets coalesced or reused out from under it. This test
+     * exercises that interleaving directly through the public API,
+     * across many scattered free-list shapes, so a future refactor that
+     * drops one of those resets shows up here as a hang (caught by the
+     * watchdog) or as corrupted/duplicated data (caught by the pattern
+     * checks) rather than as a rare, hard-to-reproduce field failure. */
+
+    enum { N = 12, SZ = 40, ROUNDS = 20 };
+    void *ptrs[N];
+    unsigned char seeds[N];
+    int all_ok = 1;
+    int data_ok = 1;
+
+    for (int round = 0; round < ROUNDS; round++) {
+        for (int i = 0; i < N; i++) {
+            ptrs[i] = my_malloc(SZ);
+            if (!ptrs[i]) { all_ok = 0; break; }
+            seeds[i] = (unsigned char)(round * N + i);
+            fill_pattern(ptrs[i], SZ, seeds[i]);
+        }
+        if (!all_ok) break;
+
+        /* Scatter frees so several independent (non-adjacent) free-list
+         * entries exist at once -- this is what gives find_suitable_block
+         * a multi-node ring to move `rover` across in the first place,
+         * rather than a single ever-growing block. */
+        for (int i = 0; i < N; i += 2) {
+            my_free(ptrs[i]);
+            ptrs[i] = NULL;
+        }
+
+        /* Immediately allocate again -- this is the moment a stale rover
+         * (if one existed) would be dereferenced by find_suitable_block's
+         * scan. Watchdog guards against a corrupted ring hanging here. */
+        watchdog_arm(5);
+        void *fresh1 = my_malloc(SZ);
+        watchdog_disarm();
+        if (!fresh1) { all_ok = 0; break; }
+        unsigned char fresh1_seed = (unsigned char)(0xE0 + round);
+        fill_pattern(fresh1, SZ, fresh1_seed);
+
+        /* Now free one of the *odd* survivors adjacent to blocks that
+         * were just freed/reused above, then allocate again right away --
+         * this specifically targets "free the block near/at the scan
+         * cursor, then immediately malloc" rather than just scattering
+         * frees at the start. */
+        int victim = 1; /* an odd index, guaranteed still allocated */
+        my_free(ptrs[victim]);
+        ptrs[victim] = NULL;
+
+        watchdog_arm(5);
+        void *fresh2 = my_malloc(SZ);
+        watchdog_disarm();
+        if (!fresh2) { all_ok = 0; break; }
+        unsigned char fresh2_seed = (unsigned char)(0xB0 + round);
+        fill_pattern(fresh2, SZ, fresh2_seed);
+
+        /* Verify every surviving block's data (not just the freshly
+         * touched ones) to catch corruption anywhere in the ring, not
+         * just at the two spots we just poked. */
+        for (int i = 0; i < N; i++) {
+            if (ptrs[i] && !check_pattern(ptrs[i], SZ, seeds[i])) {
+                data_ok = 0;
+            }
+        }
+        if (!check_pattern(fresh1, SZ, fresh1_seed)) data_ok = 0;
+        if (!check_pattern(fresh2, SZ, fresh2_seed)) data_ok = 0;
+
+        my_free(fresh1);
+        my_free(fresh2);
+        for (int i = 0; i < N; i++) {
+            if (ptrs[i]) { my_free(ptrs[i]); ptrs[i] = NULL; }
+        }
+    }
+
+    CHECK(all_ok, "all allocations across every round succeeded (no hang, no failure)");
+    CHECK(data_ok, "no data corruption from freeing near the scan cursor and reallocating");
+}
+
+/* ------------------------------------------------------------------ */
 /* Registry -- add new tests here, nowhere else.                       */
 /* ------------------------------------------------------------------ */
 
@@ -1007,6 +1242,8 @@ static const TestCase tests[] = {
     {"try_expand split after merge",         test_try_expand_split_after_merge},
     {"try_expand insufficient merge falls back", test_try_expand_insufficient_falls_back},
     {"try_expand no-prev heap-start boundary", test_try_expand_no_prev_at_heap_start},
+    {"try_expand three-way merge leaves no ghost node", test_try_expand_three_way_no_ghost_node},
+    {"rover survives adjacent free + immediate malloc", test_rover_survives_adjacent_free},
     {"canary survival",                      test_canary_survival},
     {"heap shrink boundary",                 test_heap_shrink_boundary},
     {"mmap threshold transitions",           test_mmap_threshold_transitions},
