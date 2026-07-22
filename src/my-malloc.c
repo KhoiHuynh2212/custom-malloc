@@ -5,12 +5,13 @@ static Block head = {
     .free = 0,
     .list = LIST_INIT(head.list)}; // sentinel header block
 
-static void *heap_start;
-static void *heap_end;
+static char *heap_start;
+static char *heap_end;
 static bool initialized = false;
-
 static list *rover = &head.list;
 
+long g_sbrk_calls = 0;
+long g_scan_steps = 0;
 pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void heap_init()
@@ -22,13 +23,12 @@ void heap_init()
         pthread_mutex_unlock(&global_lock);
         return;
     }
-    
 
     void *start = sbrk(MMAP_THRESHOLD);
 
     if (start == (void *)-1)
-    {   
-        pthread_mutex_unlock(&global_lock); 
+    {
+        pthread_mutex_unlock(&global_lock);
         return;
     }
 
@@ -68,6 +68,7 @@ Block *find_suitable_block(size_t requestSize)
 
     do
     {
+        g_scan_steps++;
         Block *block = list_entry(curr, Block, list);
         if (block->payload >= requestSize)
         {
@@ -81,14 +82,15 @@ Block *find_suitable_block(size_t requestSize)
     return NULL;
 }
 
-// request OS to give big chunk of memory
-Block *request_block(size_t size)
+// extend the program break by asking OS to give big chunk of memory
+Block *extend_heap(size_t size)
 {
     size_t block_chunk = size + HEADER_SIZE + FOOTER_SIZE;
-    size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk;
+    size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk + MIN_FREE_BLOCK;
 
     Block *newBlock = NULL;
     void *request = sbrk(allocate_size);
+    g_sbrk_calls++;
     if (request == (void *)-1)
     {
         return NULL;
@@ -151,8 +153,9 @@ Block *coalesce(Block *curr)
         Block *prev_block = BLOCK_PREV_HEADER(curr, (*footer));
 
         if ((char *)prev_block >= (char *)heap_start && IS_FREE(prev_block))
-        {   
-            if (rover == &prev_block->list) rover = prev_block->list.next;
+        {
+            if (rover == &prev_block->list)
+                rover = prev_block->list.next;
 
             prev_block->payload += HEADER_SIZE + FOOTER_SIZE + curr->payload;
             set_footer(prev_block);
@@ -167,12 +170,15 @@ void *my_malloc(size_t size)
     Block *curr_block;
     int s;
 
-    if (size == 0 || size >= __SIZE_MAX__ - (ALIGN - 1))
+    if (size == 0 || size >= SIZE_MAX - (ALIGN - 1))
     {
         return NULL;
     }
 
     size_t request_size = ALIGN_UP(size);
+
+    if (request_size > SIZE_MAX - ALIGN_HEADER_FOOTER)
+        return NULL;
 
     if (request_size >= MMAP_THRESHOLD)
     {
@@ -184,8 +190,8 @@ void *my_malloc(size_t size)
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
         if (ptr == MAP_FAILED)
-        {   
-            
+        {
+
             return NULL;
         }
 
@@ -211,10 +217,10 @@ void *my_malloc(size_t size)
         if (curr_block == NULL)
         {
 
-            curr_block = request_block(request_size);
+            curr_block = extend_heap(request_size);
 
             if (curr_block == NULL)
-            {   
+            {
                 pthread_mutex_unlock(&global_lock);
                 return NULL;
             }
@@ -229,22 +235,6 @@ void *my_malloc(size_t size)
                     fprintf(stderr, "pthread_mutex_unlock failed\n");
                 }
 
-                return curr_block + 1;
-            }
-
-            else
-            {
-                // TARGET SCENARIO: The block is big enough, but too small to split!
-                // never reach this branch possible 
-                SET_ALLOCATED(curr_block);
-                SET_SBRK(curr_block);
-
-                s = pthread_mutex_unlock(&global_lock);
-
-                if (s != 0)
-                {
-                    fprintf(stderr, "pthread_mutex_unlock failed\n");
-                }
                 return curr_block + 1;
             }
         }
@@ -297,7 +287,7 @@ void *my_calloc(size_t num, size_t size)
     }
 
     memset(ptr, 0, num * size);
-    
+
     return ptr;
 }
 
@@ -311,11 +301,12 @@ Block *try_expand(Block *curr, size_t new_payload)
 
     if (next_phys_is_free && (curr->payload + next_gains >= new_payload))
     {
-      
-        if (rover == &next_phys_block->list) {
+
+        if (rover == &next_phys_block->list)
+        {
             rover = next_phys_block->list.next;
         }
-        
+
         curr->payload += next_phys_block->payload + HEADER_SIZE + FOOTER_SIZE;
         list_unlink(&next_phys_block->list);
         set_footer(curr);
@@ -364,13 +355,13 @@ Block *try_expand(Block *curr, size_t new_payload)
     {
 
         if (rover == &next_phys_block->list)
-            rover = next_phys_block->list.next;  
+            rover = next_phys_block->list.next;
         list_unlink(&next_phys_block->list);
 
         if (rover == &prev_phys_block->list)
-            rover = prev_phys_block->list.next;   
+            rover = prev_phys_block->list.next;
         list_unlink(&prev_phys_block->list);
-        
+
         prev_phys_block->payload += curr->payload + next_gains + HEADER_SIZE + FOOTER_SIZE;
         prev_phys_block->free = 0;
         SET_ALLOCATED(prev_phys_block);
@@ -406,8 +397,9 @@ void *my_realloc(void *ptr, size_t size)
     if (!IS_MMAP(current_block))
     {
         int s = pthread_mutex_lock(&global_lock);
-        if (s != 0) fprintf(stderr, "pthread_mutex_lock failed\n");
-        
+        if (s != 0)
+            fprintf(stderr, "pthread_mutex_lock failed\n");
+
         // resize to smaller size, cut off and split the block
         if (request_size <= current_block->payload)
         {
@@ -429,11 +421,11 @@ void *my_realloc(void *ptr, size_t size)
                     split(surv, request_size); // split survivor block
 
                 pthread_mutex_unlock(&global_lock);
-                return surv + 1; 
+                return surv + 1;
                 // try_expand may move the data to previous address, to ensure we return correct address of the data, use block + 1
             }
         }
-
+        // TODO: FIXING INCONSISTENT POLICY HERE WITH MMAPTHRESHOLD
         Block *next_block = BLOCK_NEXT_HEADER(current_block, current_block->payload);
 
         if ((char *)next_block == (char *)heap_end)
@@ -443,19 +435,22 @@ void *my_realloc(void *ptr, size_t size)
             size_t new_payload = (buffered > request_size) ? buffered : request_size;
             size_t allocated_size = new_payload - current_block->payload;
 
-            // automatically extend the program break and update its heap and payload
-            void *request = sbrk(allocated_size);
-            if (request != (void *)-1)
+            if (request_size < MMAP_THRESHOLD)
             {
-                current_block->payload += allocated_size;
-                set_footer(current_block);
-                heap_end += allocated_size;
+                // automatically extend the program break and update its heap and payload
+                void *request = sbrk(allocated_size);
+                if (request != (void *)-1)
+                {
+                    current_block->payload += allocated_size;
+                    set_footer(current_block);
+                    heap_end += allocated_size;
 
-                if (current_block->payload >= request_size + MIN_FREE_BLOCK)
-                    split(current_block, request_size);
+                    if (current_block->payload >= request_size + MIN_FREE_BLOCK)
+                        split(current_block, request_size);
 
-                pthread_mutex_unlock(&global_lock);
-                return ptr;
+                    pthread_mutex_unlock(&global_lock);
+                    return ptr;
+                }
             }
         }
         pthread_mutex_unlock(&global_lock);
@@ -516,9 +511,10 @@ void my_free(void *ptr)
         munmap(block, ALIGN_HEADER_FOOTER + block->payload);
     }
     else
-    {   
+    {
         s = pthread_mutex_lock(&global_lock);
-        if (s != 0) fprintf(stderr, "pthread_mutex_lock failed\n");
+        if (s != 0)
+            fprintf(stderr, "pthread_mutex_lock failed\n");
         SET_FREE(block);
         set_footer(block);
         Block *survivor = coalesce(block);
@@ -556,11 +552,10 @@ void my_free(void *ptr)
 
                 heap_end = (char *)new_break;
                 sbrk(-(intptr_t)actual_shrink_amt);
-            } 
-
+            }
         }
         s = pthread_mutex_unlock(&global_lock);
-        if (s != 0) fprintf(stderr, "pthread_mutex_unlock failed\n");
+        if (s != 0)
+            fprintf(stderr, "pthread_mutex_unlock failed\n");
     }
-
 }

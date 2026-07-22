@@ -39,15 +39,6 @@
  *   capacity -- that's a legitimate thing to want to measure too, just
  *   a different question than "what does this pattern cost from cold").
  *
- * NOTE ON NAMING: my-malloc.c exposes my_malloc/my_calloc/my_realloc/
- * my_free as distinct symbols rather than shadowing libc's malloc/
- * calloc/realloc/free. That means this file can freely call ordinary
- * libc malloc/free/qsort/fopen/etc. for its own bookkeeping (scratch
- * buffers, sorting latency samples, writing the CSV) without any risk
- * of interposition weirdness -- glibc's malloc and your my_malloc are
- * two completely independent, non-conflicting allocators living in the
- * same process.
- *
  * PRODUCTION TECHNIQUES USED IN THIS FILE:
  *   - per-phase subprocess isolation for a genuinely cold starting
  *     state per benchmark case (see above) -- the same idea behind
@@ -874,20 +865,23 @@ static void phase_generational_thrash(phase_ctx_t *ctx)
      * is timed as its own interval and kept as a separate sample in the
      * series (see gen_avg_ns[]) instead of being folded into one mean. */
     for (int g = 0; g < GENERATIONS; g++) {
+        long sbrk_before = g_sbrk_calls; 
+        long scan_before = g_scan_steps; 
         double t0 = now_sec();
         for (long i = 0; i < ops_per_gen; i++) {
             op_generational_thrash(&tctx, i);
         }
         double elapsed = now_sec() - t0;
         gen_avg_ns[g] = (elapsed / (double)ops_per_gen) * 1e9;
-
+        long sbrk_calls_this_gen = g_sbrk_calls - sbrk_before; 
+        long scan_steps_this_gen = g_scan_steps - scan_before;  
         /* One CSV comment-row per generation -- not part of the main
          * timing schema (see the fragmentation phase for the same
          * convention), but exactly the series you'd pull into a
          * spreadsheet to plot the degradation curve over time. */
         if (g_csv) {
-            fprintf(g_csv, "# generational_thrash gen=%d avg_ns=%.2f survivors_alive=%ld\n",
-                    g, gen_avg_ns[g], tctx.survivor_count);
+        fprintf(g_csv, "# generational_thrash gen=%d avg_ns=%.2f survivors_alive=%ld sbrk_calls=%ld scan_steps=%ld\n",
+                g, gen_avg_ns[g], tctx.survivor_count, sbrk_calls_this_gen, scan_steps_this_gen);
         }
     }
 

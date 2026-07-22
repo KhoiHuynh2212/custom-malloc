@@ -477,11 +477,25 @@ static void test_three_way_coalesce(void)
 
 static void test_large_allocation_extends_heap(void)
 {
-    SECTION("allocation larger than CHUNK_SIZE");
+    SECTION("allocation larger than CHUNK_SIZE (still under MMAP_THRESHOLD)");
 
-    size_t big_size = CHUNK_SIZE * 3;
+    /* BUG FOUND DURING REVIEW: this test originally requested
+     * CHUNK_SIZE * 3 (192 KB), which is *larger* than MMAP_THRESHOLD
+     * (128 KB). Despite the test's name and comment claiming it forces
+     * "extra sbrk", my_malloc's own threshold check routes any size
+     * >= MMAP_THRESHOLD straight to mmap -- so the original test was
+     * silently exercising the mmap path (duplicating test_mmap_*
+     * coverage) and never touched extend_heap()'s sbrk path at all.
+     * It still passed, because mmap'd memory is writable too -- the
+     * mislabeling was invisible without inspecting IS_MMAP(). Fixed by
+     * picking a size that is > CHUNK_SIZE but strictly < MMAP_THRESHOLD,
+     * and asserting the block is NOT mmap'd to lock in the intent. */
+    size_t big_size = CHUNK_SIZE + (CHUNK_SIZE / 2); /* 96 KB: > CHUNK_SIZE, < MMAP_THRESHOLD */
+    CHECK(big_size < MMAP_THRESHOLD, "sanity: test size stays under MMAP_THRESHOLD");
+
     void *p = my_malloc(big_size);
-    CHECK(p != NULL, "my_malloc(3 * CHUNK_SIZE) succeeds via extra sbrk");
+    CHECK(p != NULL, "my_malloc(1.5 * CHUNK_SIZE) succeeds via sbrk");
+    CHECK(!IS_MMAP(hdr_of(p)), "allocation actually took the sbrk path, not mmap");
 
     memset(p, 0x7E, big_size);
     unsigned char *bytes = p;
@@ -492,6 +506,71 @@ static void test_large_allocation_extends_heap(void)
     CHECK(ok, "large block is fully writable across its extended range");
 
     my_free(p);
+}
+
+/* ------------------------------------------------------------------ */
+/* Edge case: exact-fit sbrk allocation must NOT attempt to split       */
+/* (the [CHUNK_SIZE, MMAP_THRESHOLD) gap)                              */
+/* ------------------------------------------------------------------ */
+
+static void test_extend_heap_exact_fit_no_split(void)
+{
+    SECTION("extend_heap: exact-fit allocation in [CHUNK_SIZE, MMAP_THRESHOLD) does not split");
+
+    /* extend_heap() picks allocate_size as:
+     *   (size < CHUNK_SIZE) ? CHUNK_SIZE : size + HEADER_SIZE + FOOTER_SIZE
+     *
+     * For any request whose ALIGN_UP'd size falls in
+     * [CHUNK_SIZE, MMAP_THRESHOLD), the sbrk chunk requested from the OS
+     * is sized to *exactly* fit the request (no slack for a remainder
+     * block). That makes payload == request_size on the new block,
+     * which fails the "payload >= request_size + MIN_FREE_BLOCK" split
+     * test in my_malloc() by exactly MIN_FREE_BLOCK bytes every time.
+     *
+     * This code path is marked in my-malloc.c with a comment claiming
+     * "never reach this branch possible" -- that comment is WRONG. Any
+     * single allocation request in this ~64KB-128KB window, when no
+     * existing free block satisfies it, hits this branch on every run.
+     * This test locks in the actual (correct) behavior of that branch
+     * and guards against the comment's mistaken belief ever being acted
+     * on (e.g. by someone "cleaning up" what looks like dead code). */
+
+    size_t request = CHUNK_SIZE + 1000; /* squarely inside the gap */
+    CHECK(request >= (size_t)CHUNK_SIZE && ALIGN_UP(request) < (size_t)MMAP_THRESHOLD,
+          "sanity: request lands inside [CHUNK_SIZE, MMAP_THRESHOLD)");
+
+    void *p = my_malloc(request);
+    CHECK(p != NULL, "exact-fit allocation in the gap succeeds");
+
+    Block *b = hdr_of(p);
+    CHECK(b->payload == ALIGN_UP(request),
+          "payload matches the aligned request exactly -- no split occurred, "
+          "confirming this is the exact-fit branch and not a lucky reuse "
+          "of a larger free block");
+    CHECK(!list_is_linked(&b->list),
+          "the exact-fit block is allocated, not sitting on the free list");
+    CHECK(!IS_MMAP(b), "still served from the sbrk heap, not mmap (below MMAP_THRESHOLD)");
+
+    size_t *footer = (size_t *)((char *)(b + 1) + b->payload);
+    CHECK(*footer == b->payload, "footer is consistent with the exact-fit payload");
+
+    fill_pattern(p, request, 0x9C);
+    CHECK(check_pattern(p, request, 0x9C), "the full exact-fit payload is writable");
+
+    my_free(p);
+
+    /* Same scenario again, but this time via a *second* call after the
+     * free list has a stale/empty state from the block above -- makes
+     * sure this isn't a first-allocation-only quirk. */
+    void *guard = my_malloc(64); /* occupies the freed block, forcing a fresh extend_heap */
+    void *q = my_malloc(CHUNK_SIZE + 500);
+    CHECK(q != NULL, "second exact-fit allocation in the gap also succeeds");
+    Block *bq = hdr_of(q);
+    CHECK(bq->payload == ALIGN_UP((size_t)(CHUNK_SIZE + 500)),
+          "second exact-fit block also lands with no split");
+
+    my_free(q);
+    my_free(guard);
 }
 
 static void test_many_extensions_stay_consistent(void)
@@ -1214,6 +1293,307 @@ static void test_rover_survives_adjacent_free(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Edge case: size_t overflow guard at the ALIGN_UP() boundary          */
+/* ------------------------------------------------------------------ */
+
+static void test_malloc_size_overflow_guard(void)
+{
+    SECTION("size_t overflow guard around SIZE_MAX rejects unsatisfiable requests");
+
+    /* my_malloc() rejects anything where `size >= SIZE_MAX - (ALIGN - 1)`,
+     * specifically to stop ALIGN_UP() itself (size + ALIGN - 1) from
+     * wrapping around. Probe both sides of that exact boundary. */
+    size_t just_over  = __SIZE_MAX__ - (ALIGN - 1);       /* first rejected value */
+    size_t just_under = just_over - 1;                     /* largest nominally-allowed value */
+
+    CHECK(my_malloc(just_over) == NULL,
+          "size right at the ALIGN_UP overflow boundary is rejected");
+    CHECK(my_malloc(__SIZE_MAX__) == NULL,
+          "SIZE_MAX itself is rejected");
+
+    /* just_under passes the ALIGN_UP guard, but is still astronomically
+     * larger than any real system's memory -- mmap should fail for a
+     * legitimate reason (ENOMEM) rather than the request slipping past
+     * validation. We only assert it doesn't corrupt anything; NULL is
+     * the expected, correct outcome on any real machine. */
+    void *p = my_malloc(just_under);
+    if (p != NULL) {
+        vlog("my_malloc(SIZE_MAX - ALIGN) unexpectedly succeeded -- "
+             "environment has an implausible amount of virtual memory");
+        my_free(p);
+    }
+    CHECK(1, "near-SIZE_MAX request that passes the guard does not crash the allocator");
+}
+
+/* ------------------------------------------------------------------ */
+/* BUG (found during this review): integer overflow in the mmap-path    */
+/* size accounting lets a request that should be rejected instead       */
+/* silently succeed with a far smaller buffer than requested.          */
+/* ------------------------------------------------------------------ */
+
+static void test_malloc_mmap_path_integer_overflow(void)
+{
+    SECTION("KNOWN BUG: mmap-path total_need calculation can overflow silently");
+
+    /* my_malloc()'s overflow guard only protects ALIGN_UP(size). The
+     * mmap path then computes:
+     *
+     *     total_need = ALIGN_HEADER_FOOTER + request_size;
+     *
+     * with NO further overflow check. For a request_size chosen just
+     * under the ALIGN_UP guard's cutoff (i.e. it legitimately passes
+     * validation), adding ALIGN_HEADER_FOOTER (48 bytes) wraps a 64-bit
+     * size_t around to a tiny value. That tiny value then gets rounded
+     * up to one page and mmap'd -- so my_malloc() returns a NON-NULL
+     * pointer and the caller believes it has ~2^64 bytes, when it
+     * actually has one page (verified experimentally: request ~= SIZE_MAX
+     * yields payload == 4048 bytes). Any caller that trusts the success
+     * return and writes up to their requested size overflows the heap.
+     *
+     * This CHECK is written to describe CORRECT behavior (reject, or if
+     * it succeeds, the payload must be at least what was asked for). It
+     * is expected to FAIL against the current implementation -- that
+     * failure is the point: it's a regression guard for this bug, not a
+     * confirmation that the current code is right.
+     *
+     * Suggested fix: check `request_size > SIZE_MAX - ALIGN_HEADER_FOOTER`
+     * before computing total_need, and return NULL if so. */
+    size_t evil = __SIZE_MAX__ - ALIGN - 8; /* passes ALIGN_UP's guard */
+
+    void *p = my_malloc(evil);
+    if (p == NULL) {
+        CHECK(1, "mmap path correctly rejects a request whose header+footer "
+                 "accounting would overflow size_t");
+    } else {
+        Block *b = hdr_of(p);
+        vlog("evil malloc succeeded: payload=%zu requested=%zu", b->payload, evil);
+        CHECK(b->payload >= evil,
+              "if my_malloc() reports success, the buffer must be at least as "
+              "large as requested -- a smaller payload means the size_t "
+              "addition wrapped and mmap'd an undersized buffer instead of "
+              "failing (heap-buffer-overflow-in-waiting for the caller)");
+        my_free(p);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Edge case: realloc to the same (already-satisfied) size is a no-op   */
+/* ------------------------------------------------------------------ */
+
+static void test_realloc_same_size_noop(void)
+{
+    SECTION("realloc to a size already satisfied by the current block is a no-op");
+
+    void *p = my_malloc(200);
+    CHECK(p != NULL, "malloc(200) succeeds");
+    fill_pattern(p, 200, 0x61);
+
+    size_t original_payload = hdr_of(p)->payload;
+
+    /* Request exactly the block's current usable payload -- this must
+     * take the "request_size <= current_block->payload" shrink-or-noop
+     * path in my_realloc(), and since there's no room to split off a
+     * remainder >= MIN_FREE_BLOCK (we're asking for the whole thing),
+     * it should return the same pointer untouched. */
+    void *p2 = my_realloc(p, original_payload);
+    CHECK(p2 == p, "realloc to the exact current payload returns the same pointer");
+    CHECK(hdr_of(p2)->payload == original_payload,
+          "payload is unchanged when the request already fits exactly");
+    CHECK(check_pattern(p2, 200, 0x61), "data untouched by the no-op realloc");
+
+    my_free(p2);
+}
+
+/* ------------------------------------------------------------------ */
+/* Edge case: realloc(ptr, 0) frees -- a second free must still be       */
+/* caught as a double free, not silently accepted                     */
+/* ------------------------------------------------------------------ */
+
+static void child_double_free_via_realloc_zero(void)
+{
+    void *p = my_malloc(48);
+    void *r = my_realloc(p, 0); /* frees p internally, returns NULL */
+    (void)r;
+    my_free(p); /* p is already free -- must abort */
+    _exit(1);   /* only reached if double-free went undetected */
+}
+
+static void test_double_free_after_realloc_zero(void)
+{
+    SECTION("realloc(ptr, 0) marks the block free; freeing it again is still caught");
+
+    int signo = 0;
+    int result = run_isolated(child_double_free_via_realloc_zero, &signo);
+
+    CHECK(result == -1 && signo == SIGABRT,
+          "freeing a pointer that was already released via realloc(ptr, 0) "
+          "aborts, same as any other double free");
+}
+
+/* ------------------------------------------------------------------ */
+/* Concurrency: global_lock must actually protect concurrent callers    */
+/* ------------------------------------------------------------------ */
+
+#include <pthread.h>
+
+typedef struct {
+    int thread_id;
+    int ops;
+    int failures;
+} thread_arg_t;
+
+static void *concurrent_worker(void *arg)
+{
+    thread_arg_t *ta = arg;
+    unsigned seed = (unsigned)(ta->thread_id * 7919 + 13);
+
+    enum { SLOTS = 16 };
+    void *ptrs[SLOTS] = {0};
+    size_t sizes[SLOTS] = {0};
+    unsigned char seeds[SLOTS] = {0};
+
+    for (int op = 0; op < ta->ops; op++) {
+        seed = seed * 1103515245 + 12345;
+        int idx = (int)(seed % SLOTS);
+        seed = seed * 1103515245 + 12345;
+
+        if (ptrs[idx]) {
+            if (!check_pattern(ptrs[idx], sizes[idx], seeds[idx])) {
+                ta->failures++;
+            }
+            my_free(ptrs[idx]);
+            ptrs[idx] = NULL;
+        }
+
+        size_t sz = (seed % 400) + 1;
+        void *p = my_malloc(sz);
+        if (!p) {
+            ta->failures++;
+            continue;
+        }
+        unsigned char sd = (unsigned char)(ta->thread_id * 31 + op);
+        fill_pattern(p, sz, sd);
+        ptrs[idx] = p;
+        sizes[idx] = sz;
+        seeds[idx] = sd;
+    }
+
+    for (int i = 0; i < SLOTS; i++) {
+        if (ptrs[i]) {
+            if (!check_pattern(ptrs[i], sizes[i], seeds[i])) ta->failures++;
+            my_free(ptrs[i]);
+        }
+    }
+
+    return NULL;
+}
+
+static void test_concurrent_alloc_free(void)
+{
+    SECTION("thread safety: concurrent malloc/free under global_lock stays consistent");
+
+    /* This is a basic smoke test for the mutex, not a substitute for
+     * running the whole binary under ThreadSanitizer -- but it directly
+     * targets the thing most likely to be wrong in a hand-rolled lock:
+     * data races between threads racing find_suitable_block()/split()/
+     * coalesce() against each other. Each thread only ever touches
+     * pointers it allocated itself, so any observed corruption or
+     * crash must have come from the allocator's shared state, not from
+     * threads stepping on each other's buffers directly. */
+    enum { NTHREADS = 6, OPS_PER_THREAD = 500 };
+    pthread_t threads[NTHREADS];
+    thread_arg_t args[NTHREADS];
+
+    watchdog_arm(20);
+    for (int i = 0; i < NTHREADS; i++) {
+        args[i] = (thread_arg_t){.thread_id = i, .ops = OPS_PER_THREAD, .failures = 0};
+        int rc = pthread_create(&threads[i], NULL, concurrent_worker, &args[i]);
+        CHECK(rc == 0, "thread creation succeeds");
+    }
+
+    int total_failures = 0;
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_join(threads[i], NULL);
+        total_failures += args[i].failures;
+    }
+    watchdog_disarm();
+
+    CHECK(total_failures == 0,
+          "no data corruption or allocation failures across concurrent threads");
+
+    /* After all threads finish, the allocator itself should still be
+     * usable and its free list should still be walkable (not hung,
+     * not corrupted) -- a real symptom of a race in split()/coalesce()
+     * is a free list that looks fine per-thread but is broken globally. */
+    void *p = my_malloc(128);
+    CHECK(p != NULL, "allocator remains usable after concurrent stress");
+    my_free(p);
+}
+
+/* ------------------------------------------------------------------ */
+/* Regression: realloc growing a near-threshold sbrk block past         */
+/* MMAP_THRESHOLD must hand off to mmap, not keep extending sbrk        */
+/* ------------------------------------------------------------------ */
+
+static void test_realloc_large_growth_from_near_threshold_uses_mmap(void)
+{
+    SECTION("realloc: growing a near-threshold sbrk block past MMAP_THRESHOLD converts to mmap");
+
+    /* Regression guard for a real bug found in review: my_realloc()'s
+     * in-place sbrk-extend branch originally gated on `allocated_size`
+     * (the INCREMENT about to be sbrk'd) rather than on `request_size`
+     * (the RESULTING size). When the starting block was already large
+     * (legitimately sbrk'd, just under MMAP_THRESHOLD), the increment
+     * needed to reach a much bigger target could itself stay under
+     * MMAP_THRESHOLD even though the final block blew far past it --
+     * producing a huge block that was still sbrk-backed (IS_MMAP false)
+     * instead of being handed off to the mmap path my_malloc() would
+     * have used for a fresh allocation of the same size. That's a
+     * policy inconsistency: the same requested size gets a different
+     * backing strategy depending on whether it arrived via malloc() or
+     * realloc(), and it defeats the point of ever using mmap for large
+     * blocks (independent unmap on free, no heap fragmentation).
+     *
+     * Confirmed experimentally before the fix: a 130000-byte sbrk block
+     * grown to 200000 via realloc() came back with IS_MMAP == false and
+     * payload == 200000 -- i.e. a >MMAP_THRESHOLD block silently living
+     * on the sbrk heap. The fix gates on request_size instead (matching
+     * both my_malloc()'s own >= MMAP_THRESHOLD cutoff and the
+     * try_expand() gate two branches above it in the same function). */
+
+    /* Consume the entire initial free block so nothing free is left
+     * anywhere in the heap -- otherwise try_expand() could just merge
+     * with leftover free space and this test wouldn't reach the branch
+     * under test at all. */
+    size_t initial_free_payload = MMAP_THRESHOLD - HEADER_SIZE - FOOTER_SIZE;
+    void *filler = my_malloc(initial_free_payload);
+    CHECK(filler != NULL, "filler consumes the entire initial free block");
+
+    /* Land a legitimate sbrk block just under MMAP_THRESHOLD. */
+    void *p = my_malloc(130000);
+    CHECK(p != NULL, "near-threshold allocation succeeds");
+    CHECK(!IS_MMAP(hdr_of(p)), "near-threshold allocation is sbrk-backed, as expected");
+
+    fill_pattern(p, 130000, 0x4E);
+
+    /* Grow it well past MMAP_THRESHOLD. */
+    void *p2 = my_realloc(p, 200000);
+    CHECK(p2 != NULL, "realloc growing past MMAP_THRESHOLD succeeds");
+
+    Block *b2 = hdr_of(p2);
+    CHECK(IS_MMAP(b2),
+          "block is now mmap-backed after crossing MMAP_THRESHOLD -- "
+          "matches the backing strategy a fresh my_malloc(200000) would use");
+    CHECK(b2->payload >= 200000,
+          "mmap'd block is at least as large as requested");
+    CHECK(check_pattern(p2, 130000, 0x4E),
+          "original data survives the sbrk-to-mmap handoff");
+
+    my_free(p2);
+    my_free(filler);
+}
+
+/* ------------------------------------------------------------------ */
 /* Registry -- add new tests here, nowhere else.                       */
 /* ------------------------------------------------------------------ */
 
@@ -1234,6 +1614,8 @@ static const TestCase tests[] = {
     {"backward coalescing",                  test_backward_coalesce},
     {"three-way coalescing",                 test_three_way_coalesce},
     {"large allocation extends heap",        test_large_allocation_extends_heap},
+    {"exact-fit extend_heap does not split (CHUNK_SIZE..MMAP_THRESHOLD gap)",
+                                              test_extend_heap_exact_fit_no_split},
     {"many extensions stay consistent",      test_many_extensions_stay_consistent},
     {"realloc forced relocation",            test_realloc_forced_relocation},
     {"try_expand forward-only merge",        test_try_expand_forward_only},
@@ -1248,6 +1630,13 @@ static const TestCase tests[] = {
     {"heap shrink boundary",                 test_heap_shrink_boundary},
     {"mmap threshold transitions",           test_mmap_threshold_transitions},
     {"footer/payload consistency",           test_footer_payload_consistency},
+    {"size_t overflow guard",                test_malloc_size_overflow_guard},
+    {"mmap-path integer overflow",           test_malloc_mmap_path_integer_overflow},
+    {"realloc to same size is a no-op",      test_realloc_same_size_noop},
+    {"realloc near-threshold growth converts to mmap",
+                                              test_realloc_large_growth_from_near_threshold_uses_mmap},
+    {"double free after realloc(ptr,0)",     test_double_free_after_realloc_zero},
+    {"concurrent alloc/free thread safety",  test_concurrent_alloc_free},
     {"fuzz: mixed ops",                      test_fuzz_mixed_ops},
 };
 

@@ -31,6 +31,8 @@
 #define SET_MMAP(b)       ((b)->free |= MMAP_BIT)
 #define SET_SBRK(b)       ((b)->free &= ~MMAP_BIT)  
  
+extern long g_sbrk_calls; 
+extern long g_scan_steps; 
 
 typedef struct Block
 {
@@ -54,7 +56,7 @@ typedef struct Block
 // function prototypes
 void heap_init(void);
 Block *find_suitable_block(size_t request_size);
-Block *request_block(size_t size);
+Block *extend_heap(size_t size);
 Block *split(Block *block, size_t request_payload);
 Block *coalesce(Block *curr);
 Block* try_expand(Block *curr, size_t new_payload);
