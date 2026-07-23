@@ -367,7 +367,7 @@ static void test_split_threshold(void)
           "block was NOT split when the remainder would be < MIN_FREE_BLOCK "
           "(payload left oversized on purpose)");
     vlog("original_payload=%zu tiny_shrink=%zu actual_payload=%zu MIN_FREE_BLOCK=%zu",
-         original_payload, tiny_shrink, hdr_of(p2)->payload, (size_t)MIN_FREE_BLOCK);
+         original_payload, tiny_shrink, hdr_of(p2)->payload, (size_t)MINBLOCKSIZE);
     my_free(p2);
     my_free(guard1);
 
@@ -378,8 +378,8 @@ static void test_split_threshold(void)
     size_t big_payload = hdr_of(p3)->payload;
     my_free(p3);
 
-    size_t big_shrink = big_payload > (MIN_FREE_BLOCK + ALIGN)
-                             ? big_payload - MIN_FREE_BLOCK - ALIGN
+    size_t big_shrink = big_payload > (MINBLOCKSIZE + ALIGN)
+                             ? big_payload - MINBLOCKSIZE - ALIGN
                              : ALIGN;
     void *p4 = my_malloc(big_shrink);
     CHECK(p4 == p3, "reused the same block for the split-eligible request");

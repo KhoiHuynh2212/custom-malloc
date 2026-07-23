@@ -14,7 +14,7 @@
 
 #define ALIGN _Alignof(max_align_t)
 #define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
-#define MIN_FREE_BLOCK (HEADER_SIZE + FOOTER_SIZE + ALIGN)
+#define MINBLOCKSIZE (HEADER_SIZE + FOOTER_SIZE + ALIGN)
 #define CHUNK_SIZE 64 * 1024 // 64 KB
 #define SHRINK_KEEP (CHUNK_SIZE / 4) 
 #define LINUX_PAGE sysconf(_SC_PAGESIZE)

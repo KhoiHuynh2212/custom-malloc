@@ -1074,7 +1074,7 @@ int main(int argc, char **argv)
     printf("                  (see [batch=.. samples=..] on each row -- batching keeps\n");
     printf("                  the timer's own cost negligible relative to what's measured)\n");
     printf("  ALIGN=%zu  HEADER_SIZE=%zu  FOOTER_SIZE=%zu  MIN_FREE_BLOCK=%zu  CHUNK_SIZE=%d\n",
-           (size_t)ALIGN, (size_t)HEADER_SIZE, (size_t)FOOTER_SIZE, (size_t)MIN_FREE_BLOCK, CHUNK_SIZE);
+           (size_t)ALIGN, (size_t)HEADER_SIZE, (size_t)FOOTER_SIZE, (size_t)MINBLOCKSIZE, CHUNK_SIZE);
 
     double *scratch = malloc(sizeof(double) * (size_t)cfg.ops);
     if (!scratch) { fprintf(stderr, "benchmark: could not allocate scratch buffer\n"); return 1; }

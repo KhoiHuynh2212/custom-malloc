@@ -72,6 +72,7 @@ Block *find_suitable_block(size_t requestSize)
         Block *block = list_entry(curr, Block, list);
         if (block->payload >= requestSize)
         {
+            rover = curr->next;
             return block;
         }
         curr = curr->next;
@@ -86,7 +87,7 @@ Block *find_suitable_block(size_t requestSize)
 Block *extend_heap(size_t size)
 {
     size_t block_chunk = size + HEADER_SIZE + FOOTER_SIZE;
-    size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk + MIN_FREE_BLOCK;
+    size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk + MINBLOCKSIZE;
 
     Block *newBlock = NULL;
     void *request = sbrk(allocate_size);
@@ -225,7 +226,7 @@ void *my_malloc(size_t size)
                 return NULL;
             }
 
-            if (curr_block->payload >= request_size + MIN_FREE_BLOCK)
+            if (curr_block->payload >= request_size + MINBLOCKSIZE)
             {
                 curr_block = split(curr_block, request_size);
 
@@ -239,7 +240,7 @@ void *my_malloc(size_t size)
             }
         }
 
-        if (curr_block->payload >= request_size + MIN_FREE_BLOCK)
+        if (curr_block->payload >= request_size + MINBLOCKSIZE)
         {
             curr_block = split(curr_block, request_size);
 
@@ -403,7 +404,7 @@ void *my_realloc(void *ptr, size_t size)
         // resize to smaller size, cut off and split the block
         if (request_size <= current_block->payload)
         {
-            if (current_block->payload >= request_size + MIN_FREE_BLOCK)
+            if (current_block->payload >= request_size + MINBLOCKSIZE)
                 split(current_block, request_size);
 
             pthread_mutex_unlock(&global_lock);
@@ -417,7 +418,7 @@ void *my_realloc(void *ptr, size_t size)
 
             if (surv != NULL)
             {
-                if (surv->payload >= request_size + MIN_FREE_BLOCK)
+                if (surv->payload >= request_size + MINBLOCKSIZE)
                     split(surv, request_size); // split survivor block
 
                 pthread_mutex_unlock(&global_lock);
@@ -445,7 +446,7 @@ void *my_realloc(void *ptr, size_t size)
                     set_footer(current_block);
                     heap_end += allocated_size;
 
-                    if (current_block->payload >= request_size + MIN_FREE_BLOCK)
+                    if (current_block->payload >= request_size + MINBLOCKSIZE)
                         split(current_block, request_size);
 
                     pthread_mutex_unlock(&global_lock);
