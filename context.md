@@ -1,159 +1,170 @@
-# my-malloc — Session Context
+# Session Context — Custom `malloc` Implementation (continued)
 
-*Drop this at the top of a new chat to pick up exactly where this session left off.*
+**Project:** `my-malloc.c` / `my-malloc.h` / `list.h` — sbrk+mmap allocator, moving
+from a single flat free list toward: segregated bins + a dedicated `top_chunk`
+(wilderness) pattern.
 
-## What this project is
+This supersedes the earlier `malloc-session-context.md` — read this one first;
+it includes everything from before plus what happened after.
 
-A custom heap allocator (`my-malloc.c` / `my-malloc.h`) built on an intrusive
-circular doubly-linked free list (`list.h`) plus direct `mmap()` for large
-allocations. Every allocation is prefixed with a `Block` header (`payload`,
-`free` bitflags, `list` node) and followed by a footer (copy of `payload`)
-used to walk backward for coalescing.
+---
 
+## Bugs found and fixed in the earlier part of this project (already delivered)
+
+| # | Bug | Status |
+|---|---|---|
+| 1 | `extend_heap`'s exact-fit branch mislabeled "never reach this branch possible" — reachable on every `[CHUNK_SIZE, MMAP_THRESHOLD)` request | Fixed: `allocate_size = block_chunk + MIN_FREE_BLOCK`. Test added. |
+| 2 | Integer overflow in `my_malloc`'s mmap path (`ALIGN_HEADER_FOOTER + request_size` could wrap near `SIZE_MAX`, silently mmap'ing a tiny buffer while reporting success) | Fixed: added `SIZE_MAX - ALIGN_HEADER_FOOTER` guard. Test added. |
+| 3 | `my_realloc`'s in-place sbrk-extend gated on `allocated_size` (increment) instead of `request_size` (result) — near-threshold blocks could grow well past `MMAP_THRESHOLD` while staying sbrk-backed | Fixed: gate changed to `request_size < MMAP_THRESHOLD`. Test added. |
+| 4 | `rover` (next-fit cursor) never actually advanced past a mid-scan match — degenerated to first-fit | Fixed: `rover = curr->next;` added at the successful-match return site in `find_suitable_block`. Verified: repeat search dropped from 11 scan steps to 1. |
+| 5 | `heap_init()`: `initialized = true` set (and mutex unlocked) **before** `heap_start`/`heap_end`/`bins[]`/`top_chunk` are actually written — concurrent caller can see `initialized == true` and use a null/uninitialized `top_chunk` | **Fix proposed, NOT yet applied to the real file.** Move `initialized = true` to the last statement before unlock. Confirmed via ThreadSanitizer + a plain repro (up to 7/8 worker threads observed `top_chunk == NULL`). |
+
+Full suite as of last delivery: 138/138 passing (does not yet cover bug #5, or anything below this line).
+
+---
+
+## New this session
+
+### Bug 6 — `grow_top()` has two stacked bugs, one of them a crash
+
+User pasted:
 ```c
-typedef struct Block {
-    size_t payload;   // usable size
-    int    free;      // bit 0 = FREE_BIT, bit 1 = MMAP_BIT
-    list   list;       // intrusive free-list node
-} Block;
+Block *grow_top(size_t size)
+{
+    size_t block_chunk = size + HEADER_SIZE + FOOTER_SIZE;
+    size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk + MINBLOCKSIZE;
+    void *request = sbrk(allocate_size);
+    g_sbrk_calls++;
+    if (request == (void *)-1) return NULL;
+    top_chunk = (Block *)request;
+    top_chunk->payload += allocate_size;   // BUG A
+    top_chunk->free = 0;
+    set_footer(top_chunk);
+    SET_FREE(top_chunk);
+    list_init(&top_chunk->list);
+    heap_end = (char *)request + allocate_size;
+    return top_chunk;
+}
 ```
 
-Key constants: `ALIGN=16`, `HEADER_SIZE=32`, `FOOTER_SIZE=16`,
-`MIN_FREE_BLOCK=64`, `CHUNK_SIZE=4096`, `MMAP_THRESHOLD=128KB`.
+- **Bug A (crash):** `top_chunk->payload += allocate_size` doesn't subtract
+  `HEADER_SIZE + FOOTER_SIZE`, so `set_footer()` writes 32 bytes past the
+  actual sbrk'd region. **Reproduced: SEGV on the very first call**, confirmed
+  via ASan (`SEGV on unknown address ... #0 set_footer #1 grow_top`).
+- **Bug B (silent leak):** `top_chunk = (Block *)request;` creates a **new**,
+  disconnected block at the fresh sbrk address instead of extending the
+  **existing** `top_chunk` in place. The old `top_chunk` becomes permanently
+  unreachable (not in any bin, no longer pointed to) — every call after the
+  first leaks its predecessor's entire allocation. Reproduced: isolated Bug A,
+  called `grow_top` twice, confirmed `first != second` (orphaned).
+- **Fix proposed (not yet applied to the real file):**
+  ```c
+  Block *grow_top(size_t size)
+  {
+      size_t block_chunk = size + HEADER_SIZE + FOOTER_SIZE;
+      size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk + MINBLOCKSIZE;
+      void *request = sbrk(allocate_size);
+      g_sbrk_calls++;
+      if (request == (void *)-1) return NULL;
 
-## Status: all known bugs fixed, correctness suites passing
+      // request == old heap_end == right after the existing top_chunk,
+      // by construction -- this is genuine in-place extension.
+      top_chunk->payload += allocate_size;
+      set_footer(top_chunk);
+      heap_end = (char *)request + allocate_size;
+      return top_chunk;
+  }
+  ```
+  Removed: the `top_chunk = (Block*)request` reassignment and the
+  re-initialization lines (`free`, `SET_FREE`, `list_init`) — none of that
+  should re-run on an already-initialized block.
+  **Precondition this now depends on:** `top_chunk` must already exist
+  (created by `heap_init`) before `grow_top` is ever called.
 
-Current state (37/37 basic, 49/49 edge-case checks, 0 suites failed,
-clean under ASan/UBSan) — see `test-basic.c` / `test-edge-cases.c`.
+### `top_chunk` footer — resolved
+Discussed whether `top_chunk` (always flush against `heap_end`, nothing ever
+sits to its right) needs a footer at all. Conclusion: not functionally
+required (no block will ever do a backward-coalesce lookup into it), but
+**keep it anyway** — avoids a special-case branch everywhere a block gets
+created/resized, and keeps a future heap-consistency-checker simple.
+(This is different from the researched repo's epilogue, which *must* skip
+its footer because its size is fake/unbacked memory — `top_chunk` is always
+real, backed memory, so writing its footer is just slightly wasteful, not
+dangerous, once Bug A above is fixed.)
 
-## Bugs found and fixed this session (chronological)
+### `INITIAL_HEAP_SIZE` decoupled from `MMAP_THRESHOLD`
+Chosen value: `INITIAL_HEAP_SIZE = CHUNK_SIZE` (64 KB) — ties the constant to
+the existing "one growth unit," rather than reusing `MMAP_THRESHOLD` for two
+unrelated purposes (startup size vs. mmap cutoff).
 
-1. **Uninitialized `Block.free`** — `SET_FREE`/`SET_ALLOCATED` are
-   read-modify-write macros; they only guarantee the bit they target.
-   Fresh sbrk-carved blocks (`heap_init`, `request_block`, `split`'s
-   remainder) never had `->free` zeroed first, leaving other bits
-   undefined. **Fix:** `block->free = 0;` before the first macro touches
-   each new header. Found via Valgrind.
+### Bin-index algorithm — finalized and verified
+Researched the real glibc mechanism via Azeria Labs' heap-exploitation
+series (`https://azeria-labs.com/heap-exploitation-part-2-glibc-heap-free-bins/`):
+62 small bins (exact-size, `< 1024` bytes), power-of-two large bins above
+that, small bins auto-sorted by construction (O(1) insert), large bins need
+manual sort + traversal (slower).
 
-2. **Heap shrink underflow** — `my_free()`'s shrink-to-OS logic had no
-   floor, so it could shrink a coalesced free block at `heap_end` past
-   the point where measurement started, producing negative "heap grew"
-   deltas. **Fix:** clamp shrink to `heap_start + MMAP_THRESHOLD`.
+Final single-function design, tailored to this codebase's actual
+`MMAP_THRESHOLD` (128 KB) rather than copying a range built for glibc's
+different threshold:
 
-3. **Stale `rover` → double free (serious)** — after adding a `rover`
-   next-fit pointer to `find_suitable_block()`, `split()` correctly
-   invalidated `rover` before unlinking a block, but the *sibling* path
-   in `my_malloc()` (reusing a found block without splitting) did not.
-   A self-linked, newly-allocated block left `rover` pointing at itself;
-   the next search treated it as free again, silently aliasing two live
-   pointers to the same memory. **Fix:** same `if (rover == &block->list)
-   rover = &head.list;` guard added to that path. **Lesson:** whenever a
-   new invariant like `rover` is threaded through the code, grep every
-   `list_unlink()` call site — don't trust that the common path was the
-   only one that needed the guard.
+```c
+#define SMALL_BIN_MAX      1024
+#define NUM_SMALL_BINS     64     // indices 0..63 -- index 0 permanently unused
+#define LARGE_BIN_MIN_EXP  10     // 2^10 = 1024
+#define LARGE_BIN_MAX_EXP  16     // 2^16 = 65536 -- last bin reaches up to MMAP_THRESHOLD
+#define NUM_LARGE_BINS     (LARGE_BIN_MAX_EXP - LARGE_BIN_MIN_EXP + 1)  // 7
+#define NUM_BINS           (NUM_SMALL_BINS + NUM_LARGE_BINS)            // 71
 
-4. **mmap page-rounding lost, then restored** — `mmap()` always returns
-   whole pages; recording only the requested size (not the rounded-up
-   page size) in `block->payload` threw away free headroom, which
-   silently defeated the mmap fast-path in `my_realloc`. Round the mmap
-   request up to `sysconf(_SC_PAGESIZE)` and record the *actual* mapped
-   capacity.
+int size_to_bin(size_t payload)
+{
+    if (payload < SMALL_BIN_MAX)
+        return payload >> 4;              // exact-size bin: payload / ALIGN
 
-5. **Wilderness extension: reassignment bug (severe)** — first attempt
-   at "if this block is last in the heap, just grow it via sbrk"
-   reassigned the local `block` pointer to the *new* raw sbrk memory
-   instead of extending the *existing* block's payload — orphaning the
-   original block's real size metadata and creating an untracked,
-   uninitialized phantom block. **Fix:** never reassign `block`; grow
-   `block->payload` in place, `set_footer()` again, extend `heap_end`.
+    int msb = 63 - __builtin_clzl((unsigned long)payload);
+    if (msb < LARGE_BIN_MIN_EXP) msb = LARGE_BIN_MIN_EXP;  // defensive
+    if (msb > LARGE_BIN_MAX_EXP) msb = LARGE_BIN_MAX_EXP;  // clamp, catch-all
 
-6. **Wilderness extension: fired on shrinks + size math double-counted**
-   — the `next_block == heap_end` check ran *before* checking whether
-   growth was even needed, so pure shrinks triggered a real `sbrk()`
-   call. Separately, `allocated_size` was computed from `new_payload`
-   (the *target total*) and then added *on top of* the existing
-   payload — a ~2x overshoot minimum, worse for large targets. **Fix:**
-   moved the wilderness check to only run after the "already fits" and
-   `try_expand()` checks fail (so growth is guaranteed needed by
-   construction), and compute `shortfall = new_payload - block->payload`
-   as the actual amount to request, floored at `CHUNK_SIZE` for batching.
+    return NUM_SMALL_BINS + (msb - LARGE_BIN_MIN_EXP);
+}
+```
 
-## Performance work (realloc-heavy benchmark: ~6,000 ops/s → ~5.5M ops/s)
+Verified via probe: all 7 large-bin range-pairs map to matching bins, all
+adjacent boundaries differ correctly, defensive clamp holds even for
+`SIZE_MAX`. **63 usable small bins** (index 0 dead — `ALIGN_UP` never
+produces a payload under 16), **7 large bins** — 71-slot array total.
 
-Order of investigation matters here — first hypothesis was wrong and
-worth remembering as a process lesson:
+**Rationale settled (for the diary entry the user wrote):** bin density
+should track *frequency × relative fit-waste*, not raw bin count. Small
+sizes are frequent and a bad match wastes a high percentage of a small
+request → need exact bins. Large sizes are rare and a bad match wastes a
+low percentage of a large request → power-of-two bins are cheap enough.
+Matching small-bin precision up to `MMAP_THRESHOLD` would cost ~8191 bins
+(~128 KB of sentinels) for precision that mostly never gets reused, since
+large-allocation sizes rarely repeat exactly.
 
-- **First theory (partially wrong):** assumed the free-list linear scan
-  in `find_suitable_block()` was the bottleneck under repeated realloc
-  growth. Instrumented it directly — turned out to be near-irrelevant
-  (8 calls, 5 total scan steps across 100k ops).
-- **Actual bottleneck, found via instrumentation:** ~83,000 of ~83,274
-  relocations were hitting the `mmap`/`munmap` path (large sizes cross
-  `MMAP_THRESHOLD` quickly in a growth pattern). Fixed via:
-  - **mmap page-rounding** (see bug #4 above) — gives real headroom.
-  - **Extending the "already fits" fast path to mmap blocks** — this
-    check previously only existed for sbrk blocks.
-  - **`mremap()` instead of mmap-new+memcpy+munmap-old** for mmap
-    relocations — kernel resizes via page-table updates instead of a
-    full userspace copy.
-- **`rover` next-fit search** added to `find_suitable_block()` — search
-  resumes from the last successful match instead of restarting at head
-  every call, spreading search cost as the free list grows.
-- **Wilderness extension** (see bugs #5/#6) — top-of-heap blocks grow via
-  `sbrk()` directly instead of falling through to a full relocate.
+One self-correction logged during this session: initially claimed glibc
+"keeps large bins sorted for something closer to best-fit" with more
+confidence than the source (Azeria Labs article) directly supports — the
+article confirms sorted insertion + traversal-required lookup, but doesn't
+spell out best-fit-as-a-goal in those terms. Flagged as inference, not
+direct quote.
 
-Current gap to glibc on the realloc-heavy benchmark: ~2.8x (down from
-~2,200x at the start of this investigation). Remaining gap is
-architectural — glibc has segregated size-class bins vs. this
-allocator's single free list (rover next-fit narrows but doesn't close
-that gap).
+---
 
-## Testing infrastructure (all three files use the same pattern)
+## Repos referenced this session (for the diary / future reading)
+- `vmaksimovski/Malloc-Implementation` — segregated bins + epilogue-in-last-bin trick (fake huge size, unbacked memory, must skip its footer)
+- `dlmalloc` (ARMmbed/ennorehling mirrors) — canonical top-chunk/wilderness pattern; `aradzie/dlmalloc` is a more readable rewrite
+- `lattera/glibc` — `malloc/malloc.c`, authoritative `sysmalloc()`/`_int_malloc()` top-chunk logic
+- `shellphish/how2heap` — minimal isolated top-chunk field-manipulation examples (security-education framing, but useful in isolation for seeing the mechanics)
+- Azeria Labs heap-exploitation series (part 2) — grounded the 62-small-bin / large-bin / bin-index-array structure discussion
 
-- **`test-basic.c`** / **`test-edge-cases.c`** / **`benchmark.c`** — all
-  registry-driven (`TestCase`/`PhaseCase` tables instead of hand-called
-  functions in `main()`) and fork-isolated (each test/phase runs in its
-  own child process via `fork()`, results aggregated through
-  `mmap(MAP_SHARED)` counters, so one crash doesn't kill the whole run).
-- `test-edge-cases.c` additionally nests a second fork inside
-  `test_double_free()` to catch an *intentional* `SIGABRT` — outer fork
-  protects against surprise crashes, inner fork confirms an expected one.
-- `benchmark.c`: cold-start subprocess per phase, percentile stats
-  (p50/p90/p99/max not just mean), `escape()` compiler barrier to
-  prevent `-O2` dead-code elimination, `sbrk(0)`-based heap growth
-  accounting, glibc side-by-side comparison.
+---
 
-## Known gotchas / things to double check next session
-
-- **`LINUX_PAGE` macro** (used for page-rounding) was referenced in the
-  user's local `my-malloc.c` but not present in the version of
-  `my-malloc.h` synced to this session's project files — verify it's
-  actually defined as `((size_t)sysconf(_SC_PAGESIZE))` somewhere before
-  assuming a fresh checkout compiles.
-- **`#include <stdint.h>`** for `uintptr_t` has been added/dropped a
-  couple of times across uploads in this session — double check it's
-  present in whatever version you start from next.
-- **Benchmark noise:** a single run's throughput numbers can vary ~2x
-  run to run from system noise. Always compare medians of 3+ runs before
-  concluding a change helped or hurt (this caught us once — see the
-  first growth-factor attempt that looked like a regression but was
-  actually a no-op due to a threshold guard).
-- **Fragmentation-overhead metric blind spot:** `(grown - requested) /
-  requested * 100` reports exactly `-100%` whenever `grown == 0` — true
-  whenever a workload fits entirely inside the initial 128KB heap
-  reservation. Use `--ops 50000`+ before trusting that number.
-
-## Not yet done / good next steps
-
-- **Bidirectional `try_expand()`** — currently forward-only (absorbs the
-  *next* neighbor if free). Backward absorption is possible but requires
-  changing the return type to `Block *` (survivor may not be `curr`) and
-  a `memmove()` of live payload data if the backward direction is used
-  (unlike `coalesce()`, which never needs to preserve data since it's
-  only ever called on already-free blocks).
-- **mremap growth path doesn't page-round** — `nb->payload = new_payload`
-  after a successful `mremap()` doesn't get the same page-rounding
-  headroom treatment the initial mmap path has. Lower priority than the
-  bugs above, but same pattern to apply.
-- Thread safety was never in scope this session — nothing here is safe
-  for concurrent access.
+## Not yet applied to the actual file (action items for next session)
+1. `heap_init()` race fix (Bug #5) — reorder `initialized = true` to after all setup, before unlock.
+2. `grow_top()` fix (Bug #6) — stop reassigning `top_chunk`, extend the existing block's payload in place instead; remove the redundant re-init lines.
+3. Wire `size_to_bin()` into `find_suitable_block`, `split`, `coalesce`, `try_expand`, `my_free` — replace all `&head.list` usage with `&bins[size_to_bin(payload)]`.
+4. Decide the fate of `rover` now that bins exist (likely: drop it, since narrow bins shouldn't need a persistent next-fit cursor) — not yet decided or implemented.
+5. Wire the `top_chunk` fallback tier into `my_malloc` (search bins → top_chunk → grow_top) and the coalesce-into-top rule into `my_free`/`coalesce` (guard against `list_unlink`-ing something that was never linked).
+6. Add a regression test exercising concurrent `heap_init()` calls specifically (existing concurrency test only calls `heap_init()` once, before spawning threads — never exercised bug #5).

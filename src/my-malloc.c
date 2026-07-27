@@ -7,11 +7,16 @@ static Block head = {
 
 static char *heap_start;
 static char *heap_end;
+
 static bool initialized = false;
 static list *rover = &head.list;
+static list bins[NUM_SMALL_BINS];
+
+static Block * top_chunk = NULL;
 
 long g_sbrk_calls = 0;
 long g_scan_steps = 0;
+
 pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void heap_init()
@@ -23,8 +28,8 @@ void heap_init()
         pthread_mutex_unlock(&global_lock);
         return;
     }
-
-    void *start = sbrk(MMAP_THRESHOLD);
+    // initialize the heap == 128 KB 
+    void *start = sbrk(INITIAL_HEAP_SIZE);
 
     if (start == (void *)-1)
     {
@@ -32,25 +37,44 @@ void heap_init()
         return;
     }
 
-    initialized = true;
-    pthread_mutex_unlock(&global_lock);
-
     heap_start = start;
-    heap_end = start + MMAP_THRESHOLD;
-    Block *first = (Block *)start;
+    heap_end = start + INITIAL_HEAP_SIZE;
 
-    size_t raw_payload = MMAP_THRESHOLD - HEADER_SIZE - FOOTER_SIZE;
+    for(int i = 0; i < NUM_BINS;i++) {
+        list_init(&bins[i]);
+    }
 
-    first->payload = raw_payload & ~(ALIGN - 1);
-    first->free = 0;
+    top_chunk = (Block *)start;
 
-    set_footer(first);
-    SET_FREE(first);
+    size_t raw_payload = INITIAL_HEAP_SIZE - HEADER_SIZE - FOOTER_SIZE;
 
-    list_init(&first->list);
-    list_add_after(&head.list, &first->list);
+    top_chunk->payload = raw_payload & ~(ALIGN - 1);
+    top_chunk->free = 0;
+
+    set_footer(top_chunk);
+    SET_FREE(top_chunk);
+
+    list_init(&top_chunk->list);
+
+
+    initialized = true; // turn the flag on 
+    pthread_mutex_unlock(&global_lock);
 }
 
+
+int get_bin_bucket(size_t payload) {
+    if(payload < SMALL_BIN_MAX) {
+        return payload >> 4; // exact size small bin 
+    } 
+
+
+    int msb = 63 - __builtin_clzl((unsigned) payload); 
+    
+    if(msb < LARGE_BIN_MIN_EXP) msb = LARGE_BIN_MIN_EXP;
+    if(msb > LARGE_BIN_MAX_EXP) msb = LARGE_BIN_MAX_EXP;
+
+    return NUM_SMALL_BINS + (msb - LARGE_BIN_MIN_EXP);
+}
 Block *find_suitable_block(size_t requestSize)
 {
 
@@ -83,13 +107,15 @@ Block *find_suitable_block(size_t requestSize)
     return NULL;
 }
 
-// extend the program break by asking OS to give big chunk of memory
-Block *extend_heap(size_t size)
-{
+// extend the program break by asking OS to give big chunk of memory and assume the top chunk already exists
+Block *grow_top(size_t size)
+{   
+    if(top_chunk == NULL) {
+        return NULL;
+    }
     size_t block_chunk = size + HEADER_SIZE + FOOTER_SIZE;
     size_t allocate_size = (size < CHUNK_SIZE) ? CHUNK_SIZE : block_chunk + MINBLOCKSIZE;
 
-    Block *newBlock = NULL;
     void *request = sbrk(allocate_size);
     g_sbrk_calls++;
     if (request == (void *)-1)
@@ -97,15 +123,10 @@ Block *extend_heap(size_t size)
         return NULL;
     }
 
-    newBlock = (Block *)request;
-    newBlock->payload = allocate_size - HEADER_SIZE - FOOTER_SIZE;
-    newBlock->free = 0;
-    set_footer(newBlock);
-    SET_FREE(newBlock);
-    list_init(&newBlock->list);
-
+    top_chunk->payload += allocate_size;
+    set_footer(top_chunk);
     heap_end = (char *)request + allocate_size;
-    return newBlock;
+    return top_chunk;
 }
 
 Block *split(Block *block, size_t requestPayload)
@@ -218,7 +239,7 @@ void *my_malloc(size_t size)
         if (curr_block == NULL)
         {
 
-            curr_block = extend_heap(request_size);
+            curr_block = grow_top(request_size);
 
             if (curr_block == NULL)
             {
@@ -426,7 +447,7 @@ void *my_realloc(void *ptr, size_t size)
                 // try_expand may move the data to previous address, to ensure we return correct address of the data, use block + 1
             }
         }
-        // TODO: FIXING INCONSISTENT POLICY HERE WITH MMAPTHRESHOLD
+    
         Block *next_block = BLOCK_NEXT_HEADER(current_block, current_block->payload);
 
         if ((char *)next_block == (char *)heap_end)

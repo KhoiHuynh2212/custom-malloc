@@ -17,7 +17,8 @@
 #define MINBLOCKSIZE (HEADER_SIZE + FOOTER_SIZE + ALIGN)
 #define CHUNK_SIZE 64 * 1024 // 64 KB
 #define SHRINK_KEEP (CHUNK_SIZE / 4) 
-#define LINUX_PAGE sysconf(_SC_PAGESIZE)
+#define LINUX_PAGE sysconf(_SC_PAGESIZE) 
+#define INITIAL_HEAP_SIZE CHUNK_SIZE 
 
 #define FREE_BIT      (1 << 0)   // bit 0: 1 = free, 0 = allocated
 #define MMAP_BIT      (1 << 1)   // bit 1: 1 = mmapped, 0 = sbrk'd
@@ -41,9 +42,15 @@ typedef struct Block
     list list;
 } Block;
 
+#define SMALL_BIN_MAX 1024
+#define NUM_SMALL_BINS 64 
+#define LARGE_BIN_MIN_EXP 10    // 2^ 10 = 1024
+#define LARGE_BIN_MAX_EXP 16    // 2^ 16 = 65536
+#define NUM_LARGE_BINS (LARGE_BIN_MAX_EXP - LARGE_BIN_MIN_EXP + 1)
+#define NUM_BINS (NUM_SMALL_BINS + NUM_LARGE_BINS) 
+
 #define HEADER_SIZE (sizeof(Block))
 #define FOOTER_SIZE ALIGN_UP(sizeof(size_t)) 
-
 #define ALIGN_HEADER_FOOTER ALIGN_UP(HEADER_SIZE + FOOTER_SIZE)
 #define MMAP_THRESHOLD 128 * 1024 // 128 KB
 #define SHRINK_THRESHOLD (CHUNK_SIZE * 2)  // 12 KB
@@ -56,11 +63,12 @@ typedef struct Block
 // function prototypes
 void heap_init(void);
 Block *find_suitable_block(size_t request_size);
-Block *extend_heap(size_t size);
+Block *grow_top(size_t size);
 Block *split(Block *block, size_t request_payload);
 Block *coalesce(Block *curr);
 Block* try_expand(Block *curr, size_t new_payload);
 
+size_t get_MSB_bit(size_t x);
 void my_free(void *ptr);
 
 static inline void set_footer(Block *block)
