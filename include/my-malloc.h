@@ -12,25 +12,21 @@
 #include <sys/mman.h>
 #include "list.h"
 
-#define ALIGN _Alignof(max_align_t)
+#define ALIGN _Alignof(max_align_t) // return system align
 #define ALIGN_UP(n) (((n) + ALIGN - 1) & ~(ALIGN - 1))
-#define MINBLOCKSIZE (HEADER_SIZE + FOOTER_SIZE + ALIGN)
-#define CHUNK_SIZE 64 * 1024 // 64 KB
-#define SHRINK_KEEP (CHUNK_SIZE / 4) 
-#define LINUX_PAGE sysconf(_SC_PAGESIZE) 
-#define INITIAL_HEAP_SIZE CHUNK_SIZE 
-
+#define MINBLOCKSIZE (HEADER_SIZE + FOOTER_SIZE + ALIGN) // minimum size to split
 #define FREE_BIT      (1 << 0)   // bit 0: 1 = free, 0 = allocated
 #define MMAP_BIT      (1 << 1)   // bit 1: 1 = mmapped, 0 = sbrk'd
 
-#define SET_FREE(b)      ((b)->free |= FREE_BIT)
-#define SET_ALLOCATED(b) ((b)->free &= ~FREE_BIT)
+#define SET_FREE(b)      ((b)->free |= FREE_BIT)    // set the block is free
+#define SET_ALLOCATED(b) ((b)->free &= ~FREE_BIT)   // set the block is allocated
 
-#define IS_FREE(b)        ((b)->free & FREE_BIT) 
-#define IS_MMAP(b)        ((b)->free & MMAP_BIT) 
 
-#define SET_MMAP(b)       ((b)->free |= MMAP_BIT)
-#define SET_SBRK(b)       ((b)->free &= ~MMAP_BIT)  
+#define IS_FREE(b)        ((b)->free & FREE_BIT) // check the block is free
+#define IS_MMAP(b)        ((b)->free & MMAP_BIT) // check the block is from mmap
+
+#define SET_MMAP(b)       ((b)->free |= MMAP_BIT)   // set the block is from mmap
+#define SET_SBRK(b)       ((b)->free &= ~MMAP_BIT)  // set the block is from heap
  
 extern long g_sbrk_calls; 
 extern long g_scan_steps; 
@@ -40,8 +36,12 @@ typedef struct Block
     size_t payload;
     int free;
     list list;
-} Block;
+} Block; // block header structure
 
+#define CHUNK_SIZE 64 * 1024 // 64 KB
+#define SHRINK_KEEP (CHUNK_SIZE / 4) 
+#define LINUX_PAGE sysconf(_SC_PAGESIZE) 
+#define INITIAL_HEAP_SIZE CHUNK_SIZE 
 #define SMALL_BIN_MAX 1024
 #define NUM_SMALL_BINS 64 
 #define LARGE_BIN_MIN_EXP 10    // 2^ 10 = 1024
@@ -52,8 +52,9 @@ typedef struct Block
 #define HEADER_SIZE (sizeof(Block))
 #define FOOTER_SIZE ALIGN_UP(sizeof(size_t)) 
 #define ALIGN_HEADER_FOOTER ALIGN_UP(HEADER_SIZE + FOOTER_SIZE)
-#define MMAP_THRESHOLD 128 * 1024 // 128 KB
+#define MMAP_THRESHOLD 128 * 1024 // Trigger mmap allocation
 #define SHRINK_THRESHOLD (CHUNK_SIZE * 2)  // 12 KB
+
 #define BLOCK_NEXT_HEADER(curr, payload) \
     ((Block *)((char *)((curr) + 1) + (payload) + FOOTER_SIZE))
 

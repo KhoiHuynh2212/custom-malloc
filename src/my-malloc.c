@@ -12,7 +12,7 @@ static bool initialized = false;
 static list *rover = &head.list;
 static list bins[NUM_SMALL_BINS];
 
-static Block * top_chunk = NULL;
+static Block *top_chunk = NULL;
 
 long g_sbrk_calls = 0;
 long g_scan_steps = 0;
@@ -28,7 +28,7 @@ void heap_init()
         pthread_mutex_unlock(&global_lock);
         return;
     }
-    // initialize the heap == 128 KB 
+    // initialize the heap == 128 KB
     void *start = sbrk(INITIAL_HEAP_SIZE);
 
     if (start == (void *)-1)
@@ -40,7 +40,8 @@ void heap_init()
     heap_start = start;
     heap_end = start + INITIAL_HEAP_SIZE;
 
-    for(int i = 0; i < NUM_BINS;i++) {
+    for (int i = 0; i < NUM_BINS; i++)
+    {
         list_init(&bins[i]);
     }
 
@@ -56,61 +57,71 @@ void heap_init()
 
     list_init(&top_chunk->list);
 
-
-    initialized = true; // turn the flag on 
+    initialized = true; // turn the flag on
     pthread_mutex_unlock(&global_lock);
 }
 
+int get_bin_bucket(size_t payload)
+{
+    if (payload < SMALL_BIN_MAX)
+    {
+        return payload >> 4; // exact size small bin
+    }
 
-int get_bin_bucket(size_t payload) {
-    if(payload < SMALL_BIN_MAX) {
-        return payload >> 4; // exact size small bin 
-    } 
+    int msb = 63 - __builtin_clzl((unsigned)payload);
 
-
-    int msb = 63 - __builtin_clzl((unsigned) payload); 
-    
-    if(msb < LARGE_BIN_MIN_EXP) msb = LARGE_BIN_MIN_EXP;
-    if(msb > LARGE_BIN_MAX_EXP) msb = LARGE_BIN_MAX_EXP;
+    if (msb < LARGE_BIN_MIN_EXP)
+        msb = LARGE_BIN_MIN_EXP;
+    if (msb > LARGE_BIN_MAX_EXP)
+        msb = LARGE_BIN_MAX_EXP;
 
     return NUM_SMALL_BINS + (msb - LARGE_BIN_MIN_EXP);
 }
 Block *find_suitable_block(size_t requestSize)
 {
+    int idx = get_bin_bucket(requestSize);
 
-    if (list_is_empty(&head.list))
+    if (list_is_empty(&bins[idx]))
     {
         return NULL;
     }
 
-    list *curr = rover;
-
-    if (curr == &head.list)
-        curr = curr->next;
-
-    list *start = curr;
-
-    do
+    list *curr = &bins[idx]; // curr is head of that bins
+    curr = curr->next;       // move to next block
+    Block *block = list_entry(curr, Block, list);
+    if (block->payload == requestSize)
     {
-        g_scan_steps++;
-        Block *block = list_entry(curr, Block, list);
-        if (block->payload >= requestSize)
-        {
-            rover = curr->next;
-            return block;
-        }
-        curr = curr->next;
-        if (curr == &head.list)
-            curr = curr->next;
+        return block;
+    }
+    else
+    {
 
-    } while (curr != start);
+        // TODO: PERFORM SEACHING LARGE BINS
+        Block *best;
+
+        list_for_each_entry(best, &bins[idx], list)
+        {
+
+            if (block->payload < requestSize)
+                continue;
+
+            if (block == NULL || block->payload < best->payload)
+            {
+                best = block;
+            }
+        }
+
+        return best;
+    }
+
     return NULL;
 }
 
 // extend the program break by asking OS to give big chunk of memory and assume the top chunk already exists
 Block *grow_top(size_t size)
-{   
-    if(top_chunk == NULL) {
+{
+    if (top_chunk == NULL)
+    {
         return NULL;
     }
     size_t block_chunk = size + HEADER_SIZE + FOOTER_SIZE;
@@ -189,6 +200,11 @@ Block *coalesce(Block *curr)
 
 void *my_malloc(size_t size)
 {
+    if (top_chunk == NULL)
+    {
+        heap_init();
+    }
+
     Block *curr_block;
     int s;
 
@@ -447,7 +463,7 @@ void *my_realloc(void *ptr, size_t size)
                 // try_expand may move the data to previous address, to ensure we return correct address of the data, use block + 1
             }
         }
-    
+
         Block *next_block = BLOCK_NEXT_HEADER(current_block, current_block->payload);
 
         if ((char *)next_block == (char *)heap_end)
