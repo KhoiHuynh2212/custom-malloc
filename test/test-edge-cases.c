@@ -140,7 +140,7 @@ static int run_isolated(void (*fn)(void), int *signo)
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-static Block *hdr_of(void *ptr) { return (Block *)ptr - 1; }
+static mblockptr *hdr_of(void *ptr) { return (mblockptr *)ptr - 1; }
 
 static int is_aligned(const void *ptr)
 {
@@ -216,7 +216,7 @@ static int walk_free_ring_from(list *start)
          * a real free block by reinterpreting the node as a Block, which
          * is valid because every list node in this allocator is always
          * embedded inside a Block. */
-        Block *b = list_entry(node, Block, list);
+        mblockptr *b = list_entry(node, mblockptr, list);
         if (!(b->payload == 0 && !IS_FREE(b))) {
             if (!IS_FREE(b)) {
                 return -1; /* a non-free, non-sentinel node is on the free ring */
@@ -542,7 +542,7 @@ static void test_extend_heap_exact_fit_no_split(void)
     void *p = my_malloc(request);
     CHECK(p != NULL, "exact-fit allocation in the gap succeeds");
 
-    Block *b = hdr_of(p);
+    mblockptr *b = hdr_of(p);
     CHECK(b->payload == ALIGN_UP(request),
           "payload matches the aligned request exactly -- no split occurred, "
           "confirming this is the exact-fit branch and not a lucky reuse "
@@ -565,7 +565,7 @@ static void test_extend_heap_exact_fit_no_split(void)
     void *guard = my_malloc(64); /* occupies the freed block, forcing a fresh extend_heap */
     void *q = my_malloc(CHUNK_SIZE + 500);
     CHECK(q != NULL, "second exact-fit allocation in the gap also succeeds");
-    Block *bq = hdr_of(q);
+    mblockptr *bq = hdr_of(q);
     CHECK(bq->payload == ALIGN_UP((size_t)(CHUNK_SIZE + 500)),
           "second exact-fit block also lands with no split");
 
@@ -979,7 +979,7 @@ static void test_mmap_threshold_transitions(void)
  * without rewriting the matching footer, this is what catches it -- a
  * stale footer is exactly what makes backward coalescing walk into the
  * wrong place next time a neighbor is freed. */
-static size_t block_footer_value(Block *b)
+static size_t block_footer_value(mblockptr *b)
 {
     return *(size_t *)((char *)(b + 1) + b->payload);
 }
@@ -996,7 +996,7 @@ static void test_footer_payload_consistency(void)
     for (int i = 0; i < N; i++) {
         ptrs[i] = my_malloc(sizes[i]);
         if (!ptrs[i]) { footers_ok = 0; continue; }
-        Block *b = hdr_of(ptrs[i]);
+        mblockptr *b = hdr_of(ptrs[i]);
         size_t footer = block_footer_value(b);
         if (footer != b->payload) footers_ok = 0;
         vlog("requested=%zu payload=%zu footer=%zu", sizes[i], b->payload, footer);
@@ -1010,7 +1010,7 @@ static void test_footer_payload_consistency(void)
     my_free(ptrs[1]);
     my_free(ptrs[3]);
 
-    Block *survivor = hdr_of(ptrs[2]);
+    mblockptr *survivor = hdr_of(ptrs[2]);
     CHECK(survivor->payload == sizes[2],
           "untouched neighbor block's payload is unaffected by neighboring frees");
 
@@ -1026,7 +1026,7 @@ static void test_footer_payload_consistency(void)
      * prev->next must both point back to the node itself. */
     void *fp = my_malloc(64);
     my_free(fp);
-    Block *fb = hdr_of(fp);
+    mblockptr *fb = hdr_of(fp);
     CHECK(fb->list.next->prev == &fb->list && fb->list.prev->next == &fb->list,
           "freed block's list node is symmetrically linked in both directions");
 
@@ -1365,7 +1365,7 @@ static void test_malloc_mmap_path_integer_overflow(void)
         CHECK(1, "mmap path correctly rejects a request whose header+footer "
                  "accounting would overflow size_t");
     } else {
-        Block *b = hdr_of(p);
+        mblockptr *b = hdr_of(p);
         vlog("evil malloc succeeded: payload=%zu requested=%zu", b->payload, evil);
         CHECK(b->payload >= evil,
               "if my_malloc() reports success, the buffer must be at least as "
@@ -1580,7 +1580,7 @@ static void test_realloc_large_growth_from_near_threshold_uses_mmap(void)
     void *p2 = my_realloc(p, 200000);
     CHECK(p2 != NULL, "realloc growing past MMAP_THRESHOLD succeeds");
 
-    Block *b2 = hdr_of(p2);
+    mblockptr *b2 = hdr_of(p2);
     CHECK(IS_MMAP(b2),
           "block is now mmap-backed after crossing MMAP_THRESHOLD -- "
           "matches the backing strategy a fresh my_malloc(200000) would use");
