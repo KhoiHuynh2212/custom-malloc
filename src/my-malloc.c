@@ -203,8 +203,7 @@ mblockptr *coalesce(mblockptr *curr)
 
     return curr;
 }
-// TODO: REIMPLEMENT MALLOC
-//  MALLOC -> SEARCH BINS -> NOT FOUND -> CARVE FROM TOP CHUNK -> BIG ENOUGH -> SPLIT
+
 void *my_malloc(size_t size)
 {
     if (gm.top_chunk == NULL)
@@ -330,6 +329,26 @@ mblockptr *try_expand(mblockptr *curr, size_t new_payload)
 
     // TODO : gm.topchunk case
     mblockptr *next = BLOCK_NEXT_HEADER(curr, curr->payload);
+
+    if(next == gm.top_chunk) {
+
+        if(new_payload >= gm.topsize) {
+            if(grow_top(new_payload) == NULL) {
+                return NULL;
+            }
+        }
+        size_t needed = new_payload -curr->payload;
+        curr->payload = new_payload;
+        gm.topsize -= needed; 
+        
+        set_footer(curr); // re-calculate the footer 
+
+        mblockptr * np = BLOCK_NEXT_HEADER(curr, curr->payload); 
+
+        gm.top_chunk = np;
+
+        return curr;
+    }
 
     int next_free = ((char *)next < gm.heap_end && IS_FREE(next));
 
