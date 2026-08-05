@@ -486,12 +486,12 @@ static inline void list_splice(list *target, list *source)
          (pos) != (head);                         \
          (pos) = (n), (n) = (pos)->next)
 
-#define list_for_each_entry(_ptr, _head, _m)            \
-    for ((_ptr) = list_entry((_head)->next,             \
-                             __typeof__(*(_ptr)), _m);  \
-         &(_ptr)->_m != (_head);                        \
-         (_ptr) = list_entry((_ptr)->_m.next,           \
-                             __typeof__(*(_ptr)), _m))
+#define list_for_each_entry(entry, list_head, list_member)              \
+    for ((entry) = list_entry((list_head)->next,                       \
+                               __typeof__(*(entry)), list_member);     \
+         &(entry)->list_member != (list_head);                         \
+         (entry) = list_entry((entry)->list_member.next,               \
+                               __typeof__(*(entry)), list_member))
 
 static inline size_t list_length(const list* head) {
 

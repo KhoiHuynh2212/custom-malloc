@@ -184,11 +184,12 @@ mblockptr *coalesce(mblockptr *curr)
     // the next block is top chunk, absorb to top chunk
     if(next == gm.top_chunk) {
         
-        gm.topsize += ABSORB(next->payload);
+        curr->payload += ABSORB(next->payload);
+
+        gm.topsize = curr->payload;
 
         gm.top_chunk = curr;
 
-        curr->payload += ABSORB(next->payload);
         
         return curr;
     } 
