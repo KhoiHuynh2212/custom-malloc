@@ -42,7 +42,7 @@ void heap_init()
 
     gm.top_chunk->payload = raw_payload & ~(ALIGN - 1);
     gm.topsize = gm.top_chunk->payload; // update the top size;
-    gm.top_chunk->free = 0;
+    gm.top_chunk->flags = 0;
     SET_FREE(gm.top_chunk);
 
     list_init(&gm.top_chunk->list);
@@ -143,7 +143,7 @@ mblockptr *split(mblockptr *block, size_t request_size)
 {
     mblockptr *remainder = BLOCK_NEXT_HEADER(block, request_size);
     remainder->payload = block->payload - REQUEST_CHUNK(request_size);
-    remainder->free = 0;
+    remainder->flags = 0;
     SET_FREE(remainder); // set it as free;
     set_footer(remainder);
     list_init(&remainder->list);
@@ -242,7 +242,7 @@ void *my_malloc(size_t size)
         }
 
         curr_block = (mblockptr *)ptr;
-        curr_block->free = 0;
+        curr_block->flags = 0;
         SET_ALLOCATED(curr_block);
         SET_MMAP(curr_block);
         curr_block->payload = total_page_up - HEADER_SIZE - FOOTER_SIZE;
@@ -264,8 +264,10 @@ void *my_malloc(size_t size)
         if (curr_block == NULL)
         {
 
+            // carve from the top chunk
             if (request_size >= gm.topsize)
-            {
+            {   
+                // grow if the top chunk is too small
                 if (grow_top(request_size) == NULL)
                 {
                     pthread_mutex_unlock(&global_lock);
@@ -273,12 +275,14 @@ void *my_malloc(size_t size)
                 }
             }
 
+            
             mblockptr *p = gm.top_chunk; // start at old top
-            p->payload = request_size;
+            size_t needed = request_size + ALIGN_HEADER_FOOTER;
+            p->payload = needed;   // 
             SET_ALLOCATED(p);
             set_footer(p);
 
-            gm.topsize -= request_size;
+            gm.topsize -= needed;
             gm.top_chunk = BLOCK_NEXT_HEADER(p, request_size); // bump request byte
 
             curr_block = p;
@@ -379,7 +383,7 @@ mblockptr *try_expand(mblockptr *curr, size_t new_payload)
 
         list_unlink(&prev->list);
         prev->payload += REQUEST_CHUNK(curr->payload) ;
-        prev->free = 0;
+        prev->flags = 0;
         set_footer(prev);
 
         if (curr->payload > 0)
@@ -507,11 +511,18 @@ void *my_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
+
+
 void my_free(void *ptr)
 {
     if (ptr == NULL)
         return;
-    mblockptr *block = (mblockptr *)ptr - 1;
+
+
+    // get the block header 
+    mblockptr *block = (mblockptr *)ptr - 1; 
+
+
     int s;
     if (IS_FREE(block))
     {

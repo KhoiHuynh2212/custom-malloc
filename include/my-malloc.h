@@ -18,14 +18,14 @@
 #define FREE_BIT (1 << 0)                                // bit 0: 1 = free, 0 = allocated
 #define MMAP_BIT (1 << 1)                                // bit 1: 1 = mmapped, 0 = sbrk'd
 
-#define SET_FREE(b) ((b)->free |= FREE_BIT)       // set the block is free
-#define SET_ALLOCATED(b) ((b)->free &= ~FREE_BIT) // set the block is allocated
+#define SET_FREE(b) ((b)->flags |= FREE_BIT)       // set the block is free
+#define SET_ALLOCATED(b) ((b)->flags &= ~FREE_BIT) // set the block is allocated
 
-#define IS_FREE(b) ((b)->free & FREE_BIT) // check the block is free
-#define IS_MMAP(b) ((b)->free & MMAP_BIT) // check the block is from mmap
+#define IS_FREE(b) ((b)->flags & FREE_BIT) // check the block is free
+#define IS_MMAP(b) ((b)->flags & MMAP_BIT) // check the block is from mmap
 
-#define SET_MMAP(b) ((b)->free |= MMAP_BIT)  // set the block is from mmap
-#define SET_SBRK(b) ((b)->free &= ~MMAP_BIT) // set the block is from heap
+#define SET_MMAP(b) ((b)->flags |= MMAP_BIT)  // set the block is from mmap
+#define SET_SBRK(b) ((b)->flags &= ~MMAP_BIT) // set the block is from heap
 
 extern long g_sbrk_calls;
 extern long g_scan_steps;
@@ -33,7 +33,7 @@ extern long g_scan_steps;
 typedef struct Block_Header
 {
     size_t payload;
-    int free;
+    unsigned int flags;
     list list;
 } mblockptr; // block header structure 
 
