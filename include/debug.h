@@ -5,7 +5,7 @@
 void check_heap(void);
 void check_bins(void);
 void check_top_chunk(void);
-
+void check_malloced_chunk(void *ptr, size_t requested_size);
 #else
 
 #define check_heap() ((void)0)
