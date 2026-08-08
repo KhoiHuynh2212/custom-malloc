@@ -72,7 +72,7 @@ automatically if CHUNK_SIZE is retuned. Currently: 2 * 64 KB = 128 KB.
     ((mblockptr *)((char *)curr - FOOTER_SIZE - prev_size - HEADER_SIZE))
 
 
-typedef struct {
+typedef struct malloc_state {
     mblockptr *top_chunk; 
     list bins[NUM_BINS];
     size_t topsize; 
@@ -87,9 +87,10 @@ mblockptr *grow_top(size_t size);
 mblockptr *split(mblockptr *block, size_t request_payload);
 mblockptr *coalesce(mblockptr *curr);
 mblockptr *try_expand(mblockptr *curr, size_t new_payload);
+
 int get_bin_bucket(size_t payload);
 size_t get_MSB_bit(size_t x);
-void my_free(void *ptr);
+
 
 static inline void set_footer(mblockptr *block)
 {        
@@ -99,9 +100,13 @@ static inline void set_footer(mblockptr *block)
     *footer = block->payload;
     assert(*footer == block->payload);
 }
+
+void insert_small_chunk(mblockptr * chunk, size_t size);
+void insert_large_chunk( mblockptr * chunk, size_t size);
+
 void *my_malloc(size_t size);
 void *my_realloc(void *ptr, size_t size);
 void *my_calloc(size_t num, size_t size);
-
+void my_free(void *ptr);
 #endif // MY_MALLOC_H 
 

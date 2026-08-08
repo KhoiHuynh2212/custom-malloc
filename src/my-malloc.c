@@ -511,7 +511,15 @@ void *my_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
+void insert_small_chunk(mblockptr * chunk,size_t size) {
+    int idx = get_bin_bucket(size);
+    list* head = &gm.bins[idx];   // now at the sentinel head       
+    list_push_front(head, &chunk->list);
+}
 
+void insert_large_chunk() {
+
+}
 
 void my_free(void *ptr)
 {
@@ -521,7 +529,10 @@ void my_free(void *ptr)
 
     // get the block header 
     mblockptr *block = (mblockptr *)ptr - 1; 
-
+    
+    size_t size = block->payload;
+    // TODO: check if smaller than SMALL_BIN_MAX then decide which functions to call
+    // Coalesce trước biết size rồi mới insert vào bins
 
     int s;
     if (IS_FREE(block))
@@ -532,7 +543,7 @@ void my_free(void *ptr)
 
     if (IS_MMAP(block))
     {
-        // Crash on double free
+       
         munmap(block, ALIGN_HEADER_FOOTER + block->payload);
     }
     else
@@ -546,6 +557,8 @@ void my_free(void *ptr)
         if (survivor == block)
             list_add_after(&gm.bins[get_bin_bucket(survivor->payload)], &survivor->list);
 
+
+        
         char *block_end = (char *)survivor + HEADER_SIZE + survivor->payload + FOOTER_SIZE;
         /*  If the last block is bigger than a shrink threshold, we shrink and return memory for OS, but we must to make sure that we
             don't shrink too much to even below the inital heap size
