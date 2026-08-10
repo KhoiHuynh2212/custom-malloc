@@ -102,7 +102,7 @@ static inline void set_footer(mblockptr *block)
 }
 
 void insert_small_chunk(mblockptr * chunk, size_t size);
-void insert_large_chunk( mblockptr * chunk, size_t size);
+void insert_large_chunk(mblockptr * chunk, size_t size);
 
 void *my_malloc(size_t size);
 void *my_realloc(void *ptr, size_t size);

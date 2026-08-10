@@ -517,7 +517,24 @@ void insert_small_chunk(mblockptr * chunk,size_t size) {
     list_push_front(head, &chunk->list);
 }
 
-void insert_large_chunk() {
+void insert_large_chunk(mblockptr * chunk,size_t size) {
+
+    int idx = get_bin_bucket(size);
+
+    list* head = &gm.bins[idx]; 
+
+    list* pos = head->next;
+
+    while(pos != head) {
+        mblockptr * pos_block = list_entry(pos, mblockptr, list);
+        mblockptr * next = pos->next;
+
+        // insert before to keep sorted list 
+        if(chunk->payload < pos_block->payload) {
+            list_add_before(pos,&chunk->list);
+        }     
+        pos = next;
+    }
 
 }
 
@@ -526,13 +543,9 @@ void my_free(void *ptr)
     if (ptr == NULL)
         return;
 
-
     // get the block header 
     mblockptr *block = (mblockptr *)ptr - 1; 
     
-    size_t size = block->payload;
-    // TODO: check if smaller than SMALL_BIN_MAX then decide which functions to call
-    // Coalesce trước biết size rồi mới insert vào bins
 
     int s;
     if (IS_FREE(block))
@@ -554,17 +567,28 @@ void my_free(void *ptr)
         SET_FREE(block);
         set_footer(block);
         mblockptr *survivor = coalesce(block);
-        if (survivor == block)
-            list_add_after(&gm.bins[get_bin_bucket(survivor->payload)], &survivor->list);
 
+        if (survivor == gm.top_chunk)
+        {
+            // if the coalesced block is the top chunk, we don't need to insert it into bins
+            pthread_mutex_unlock(&global_lock);
+            return;
+        }
 
+        size_t final_size = survivor->payload;
+
+        if(final_size < SMALL_BIN_MAX) {
+            insert_small_chunk(survivor, final_size);
+        } else {
+            insert_large_chunk(survivor, final_size);
+        }
         
-        char *block_end = (char *)survivor + HEADER_SIZE + survivor->payload + FOOTER_SIZE;
-        /*  If the last block is bigger than a shrink threshold, we shrink and return memory for OS, but we must to make sure that we
-            don't shrink too much to even below the inital heap size
-        */
+        /** If the top chunk is bigger than a shrink threshold, 
+            we shrink and return memory for OS, but we must to make sure 
+            that we don't shrink too much to even below the inital top chunk size
+        **/
 
-        if (block_end == gm.heap_end && survivor->payload >= SHRINK_THRESHOLD)
+        if (gm.topsize >= SHRINK_THRESHOLD)
         {
             uintptr_t floor = (uintptr_t)gm.heap_start + MMAP_THRESHOLD;
             uintptr_t new_break = (uintptr_t)gm.heap_end - survivor->payload + SHRINK_KEEP;
@@ -581,13 +605,8 @@ void my_free(void *ptr)
             if (actual_shrink_amt > 0)
             {
 
-                list_unlink(&survivor->list);
-
                 // Calculate the new payload size based on the actual new break
-                survivor->payload = (size_t)(new_break - (uintptr_t)survivor - HEADER_SIZE - FOOTER_SIZE);
-                set_footer(survivor);
-                list_add_after(&gm.bins[get_bin_bucket(survivor->payload)], &survivor->list);
-
+                gm.topsize = (size_t)(new_break - (uintptr_t)survivor - HEADER_SIZE - FOOTER_SIZE);
                 gm.heap_end = (char *)new_break;
                 sbrk(-(intptr_t)actual_shrink_amt);
             }
