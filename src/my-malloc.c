@@ -135,6 +135,7 @@ mblockptr *grow_top(size_t size)
     }
 
     gm.top_chunk->payload += allocate_size;
+    gm.topsize = gm.top_chunk->payload;
     gm.heap_end = (char *)request + allocate_size;
     return gm.top_chunk;
 }
@@ -278,12 +279,17 @@ void *my_malloc(size_t size)
             
             mblockptr *p = gm.top_chunk; // start at old top
             size_t needed = request_size + ALIGN_HEADER_FOOTER;
-            p->payload = needed;   // 
+            p->payload = request_size ;   
             SET_ALLOCATED(p);
             set_footer(p);
 
             gm.topsize -= needed;
             gm.top_chunk = BLOCK_NEXT_HEADER(p, request_size); // bump request byte
+
+
+            gm.top_chunk->payload = gm.topsize;
+            gm.top_chunk->flags = 0;
+            SET_FREE(gm.top_chunk);
 
             curr_block = p;
         }
@@ -349,9 +355,10 @@ mblockptr *try_expand(mblockptr *curr, size_t new_payload)
         set_footer(curr); // re-calculate the footer 
 
         mblockptr * np = BLOCK_NEXT_HEADER(curr, curr->payload); 
-
         gm.top_chunk = np;
-
+        gm.top_chunk->payload = gm.topsize;
+        gm.top_chunk->flags = 0;
+        SET_FREE(gm.top_chunk);
         return curr;
     }
 
@@ -532,6 +539,7 @@ void insert_large_chunk(mblockptr * chunk,size_t size) {
         // insert before to keep sorted list 
         if(chunk->payload < pos_block->payload) {
             list_add_before(pos,&chunk->list);
+            return;
         }     
         pos = next;
     }
