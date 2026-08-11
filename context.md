@@ -1,139 +1,141 @@
-# Session Context — my-malloc.c refactor
+# Custom Allocator (`my-malloc`) — Session Context
 
-## What we found & fixed
-Core theme: a block's `payload` (or `gm.topsize`) got changed without
-unlinking it from its old bin first, or without recomputing dependent
-values in the right order/units — causing stale/corrupted free-list state.
+Handoff notes from a mentoring/code-review session on a custom `malloc`/`free`
+implementation. Architecture: **array-based bins with sorted linked lists**
+(no tree — an intentional, fixed constraint of this project), loosely modeled
+on dlmalloc's design but adapted throughout since the tree-bin approach isn't
+available here.
 
-- **`find_suitable_block`**: large-bin best-fit search returned a block
-  without calling `list_unlink`. — FIXED.
-- **`my_malloc`**: double `pthread_mutex_unlock` in the split branch. —
-  FIXED.
-- **`coalesce`**: restructured to merge sequentially — prev first (unlink,
-  grow, `set_footer`, reassign `curr = prev`), then recompute `next` from
-  the *new* `curr` before checking it. Added top-chunk absorb case with
-  early `return curr;` so it can't fall through and double-merge. — FIXED
-  the unlink-order/structure.
-  - **`gm.topsize` double-count bug — FIXED**: was `gm.topsize +=
-    ABSORB(next->payload);`, double-counting since `gm.topsize` already
-    equaled `next->payload` before the branch ran. Changed to
-    `gm.topsize = curr->payload;` (a set, after `curr->payload +=
-    ABSORB(next->payload);`) — since `curr` fully absorbs `next` and
-    becomes the new top chunk, `gm.topsize` just mirrors `curr->payload`
-    directly instead of accumulating on top of a stale value.
-- **`try_expand`**: restructured from 3 duplicated branches (next-only /
-  prev-only / triple) into sequential merge (next first, early-return if
-  `new_payload` met, else prev with unlink+grow+`memmove`). Fixed missing
-  `list_unlink` on `next` in the old triple branch. — FIXED.
-  - **Top-chunk case added, one bug fixed, one NOT YET FIXED**:
-    - FIXED: `needed` is now computed *before* overwriting `curr->payload`
-      (earlier draft computed it after, causing unsigned underflow).
-    - **NOT YET FIXED**: `needed = new_payload - REQUEST_CHUNK(curr->payload);`
-      still wraps `curr->payload` in `REQUEST_CHUNK`, adding
-      `HEADER_SIZE + FOOTER_SIZE` overhead that doesn't belong — this is a
-      *partial* carve (unlike coalesce's full absorb), so `next`/old-top
-      isn't being dissolved, just shrunk, and the leftover chunk (`np`)
-      still needs its own header reserved. Correct line:
-      `size_t needed = new_payload - curr->payload;` — plain payload diff,
-      no `REQUEST_CHUNK` wrapper.
+Reference implementation studied alongside this project:
+`https://github.com/KhoiHuynh2212/dlmalloc/` (a modularized fork of Doug Lea's
+dlmalloc — used for grounding design comparisons, not copied directly).
 
-## Still open / next session
-- [ ] **`try_expand`** top-carve: fix `needed` calculation — drop
-      `REQUEST_CHUNK`, use plain `new_payload - curr->payload`.
-- [ ] **`my_free`**: bins the survivor only `if (survivor == block)` — now
-      that `coalesce` unlinks on every merge path, every outcome needs
-      (re)binning, not just the no-merge case. **NOT YET FIXED.**
-- [ ] `check_top_chunk()` is currently an empty/broken stub (`bool
-      check_top_chunk() { char* }` — doesn't even compile). Needs a real
-      body. Invariant to assert:
-      `(char *)(gm.top_chunk + 1) + gm.topsize == gm.heap_end`
-      (double check whether top reserves a footer — would shift this by
-      `FOOTER_SIZE` if so). This single assert would have caught both
-      `gm.topsize` bugs above immediately.
-- [ ] Decide on debug-check file structure (see below) and create
-      `debug.c`/`debug.h`.
-- [ ] Manually trace/test `try_expand`'s sequential merge (next-then-prev)
-      against edge cases — logic changed shape this session, not yet
-      tested.
+---
 
-## Design notes worth remembering
-- Coalesce/merge is about **physical adjacency**, not shared bins.
-- `IS_FREE(block) == true` is an invariant: "this block is currently linked
-  into some bin." Always unlink before growing/absorbing a free neighbor.
-- Order of operations: compute anything derived from the *old* value of a
-  variable **before** overwriting it. Caught this pattern multiple times
-  this session (coalesce top-absorb, try_expand's `needed`).
-- **Full absorb vs. partial carve are different operations, need different
-  math**: `coalesce`'s top-absorb fully dissolves `next` into `curr` (use
-  `REQUEST_CHUNK`/`ABSORB` — header+footer+payload all fold in).
-  `try_expand`'s top-carve only takes part of top's space and leaves a new,
-  smaller top chunk behind with its own header — using `REQUEST_CHUNK`
-  there steals bytes that actually belong to the new top chunk's header.
-  Rule of thumb: dissolving a block entirely → include its overhead in the
-  math; carving/shrinking a block while it (or a remnant) still exists →
-  plain payload arithmetic only.
-- Whenever a block "becomes" the new top chunk (fully absorbed), set
-  `gm.topsize = curr->payload` directly rather than incrementing it — two
-  numbers that are supposed to always mirror each other should have one
-  source of truth, not be maintained by parallel `+=` operations that can
-  drift apart.
-- dlmalloc doesn't backward-merge during realloc (avoids memmove) — our
-  `try_expand` deliberately trades a copy for a better chance of avoiding a
-  full realloc-and-copy. Known, deliberate difference.
-- Sequential merge order (try one neighbor, check goal, try the other)
-  replaces duplicated next-only/prev-only/triple branches — each merge's
-  logic (unlink → grow → optional memmove) now lives in exactly one place.
+## Architecture summary
 
-## Design fork for next session: unified size field vs. invariant checks
-Discussed refactoring `mblockptr` to store one combined `size` field
-(header+payload+footer, dlmalloc-style boundary tags with flag bits in the
-low bits) instead of a separate `payload` field — this session's bugs were
-all variations of "forgot to add/subtract the right overhead combination
-by hand," which a unified field mostly eliminates.
+- `bin_map_t`-style bitmap concept discussed (dlmalloc reference), but **not
+  needed** in this project — bins here use `list_is_empty()` for O(1)
+  "is this bin empty" checks, so no bitmap layer was added.
+- Small bins: fixed-size buckets, O(1) insert (push front) and O(1) delete
+  (splice via existing `fd`/`bk`, no search).
+- Large bins: sorted linked list per bucket (`get_bin_bucket()` ranges).
+  Insert is O(n) to find sort position; delete is still O(1) once you already
+  have the chunk pointer (no search needed — this was a point of confusion
+  earlier in the session, since it's a common misconception that delete is
+  also O(n)).
+- `top_chunk` / `topsize`: must always satisfy the invariant
+  `top_chunk->payload == topsize`. Several bugs stemmed from this invariant
+  being silently violated.
+- `MIN_CHUNK_SIZE` in this project's header struct = 32 bytes, which is why
+  `bins[0]` (and possibly `bins[1]`, depending on whether `small_index()` is
+  fed payload-only or total chunk size) is structurally unreachable — this is
+  expected/normal, matches the same phenomenon in dlmalloc's own small bin
+  array, not a bug.
 
-- **Scope if pursued**: touches the `mblockptr` struct, every macro that
-  does size math (`BLOCK_NEXT_HEADER`, `BLOCK_PREV_HEADER`,
-  `REQUEST_CHUNK`, `ABSORB`, `set_footer`), and every merge site
-  (`coalesce`, `try_expand`, `split`, top-carve in `my_malloc`). Caller-
-  facing behavior (`my_malloc`/`my_realloc` signatures, returned size)
-  unaffected — purely internal.
-- **Hesitation raised**: using dlmalloc's unified-size pattern isn't
-  "cloning dlmalloc" — it's a standard solution to a problem this session
-  proved is real — but it's a legitimate concern about the project staying
-  distinctly *yours*, not just a smaller dlmalloc.
-- **Middle-ground option**: keep the current split-field (`payload`)
-  design as-is, and lean on `check_top_chunk()` + sibling invariant
-  asserts (`check_free_list()`, `check_block_header()`) to catch overhead-
-  accounting bugs immediately in dev builds, instead of by hand-tracing.
-  Keeps the design decisions yours; trades some of the refactor's safety
-  benefit for keeping the current architecture.
-- **Decision**: left open for next session — not committing to either yet.
+---
 
-## New tool introduced this session: assert-based invariant checks
-- Pattern: after any state mutation you're unsure about, assert the
-  invariant you expect to hold.
-- `assert` compiles to nothing when `NDEBUG` is defined — dev-time safety
-  net only, not a substitute for real error handling on user-facing paths.
-- Planned structure for a bigger project:
-  - Dedicated `debug.c`/`debug.h` pair, one check function per invariant
-    (`check_top_chunk()`, `check_free_list()`, `check_block_header()`)
-    rather than one giant do-everything check.
-  - Guard the whole `debug.c` file with `#ifdef DEBUG`; declare no-op
-    macros in `debug.h` for the non-debug case, so call sites in
-    `malloc.c` never need `#ifdef` clutter.
-  - Call sites belong at the boundary of trust: right after any function
-    that mutates shared state, before control returns to a less-trusted
-    caller.
+## Bugs found this session
 
-## Suggested commits (not yet made)
+| # | Location | Description | Status |
+|---|---|---|---|
+| **1** | `grow_top()` + `my_malloc()` top-carve path | `grow_top()` updated `top_chunk->payload` but never `gm.topsize`; `my_malloc()` then overwrote `payload` and subtracted `needed` from the **stale** `topsize` → unsigned integer underflow, `topsize` becomes a huge garbage value. Also: newly split-off top chunk's header (`payload`/`flags`/`SET_FREE`) was never initialized. | ✅ Fixed — `grow_top()` now does `gm.topsize = gm.top_chunk->payload;` after growing; `my_malloc()` now initializes the new top chunk's header fields explicitly. |
+| **2** | `insert_large_chunk()` | Loop never `break`s/`return`s after insertion (risk of double-splice), and has **no fallback insert-at-tail** — if the freed chunk is larger than every existing entry in its bin, it's silently never inserted anywhere. Chunk becomes an unreachable "leak" in the allocator's own bookkeeping. | ⏳ Open — not yet fixed. |
+| **3** | `my_free()` shrink-to-OS block | Uses `survivor` (an arbitrary just-coalesced chunk, guaranteed *not* to be `top_chunk` since that case returns early) instead of `gm.top_chunk`/`gm.topsize` to compute `new_break`. Only valid if `survivor` happens to be adjacent to `heap_end`, which isn't checked. | ⏳ **Not actually a bug** — user confirmed this section of `free()` is unfinished/mid-refactor, not a landed defect. Revisit once shrink logic is completed. |
+| **4** | `my_malloc()` top-carve, line ~282 | `p->payload = needed` (where `needed = request_size + ALIGN_HEADER_FOOTER`, i.e. the chunk's *total footprint*) — should be `p->payload = request_size` (pure payload only), matching the convention used everywhere else in the file (`split()`, `try_expand()`, `heap_init()`). Causes `BLOCK_NEXT_HEADER` to compute the wrong location for the next chunk on every future heap walk touching this block (e.g. in `coalesce()` when it's later freed) — corrupts heap walking, not a rare edge case since it affects the main top-carve growth path. | ⏳ Open — one-line fix identified, not yet confirmed applied. |
+| — | `try_expand()` top-chunk branch | Same missing-header-init issue as Bug 1's second half. | ✅ Fixed — confirmed matches the corrected `my_malloc()` pattern. |
+| — | `coalesce()` | No bug — was already correct; it was only a victim of corrupted upstream state from Bugs 1/4. No changes needed. | ✅ Confirmed correct as-is. |
+
+---
+
+## `debug.c` / `debug.h` review
+
+Existing checks (`check_top_chunk`, `check_bins`, `check_heap`) are a solid
+foundation but have a coverage gap: **nothing cross-validates that every
+free chunk found by walking the heap actually appears in some bin.** This
+gap is exactly what would let Bug 2 (lost large chunk) pass silently.
+
+Proposed addition (not yet added to the file):
+```c
+void check_heap_bin_consistency(void)
+{
+    // walk heap, count free chunks (excluding top)
+    // walk all gm.bins[], count total via list_length()
+    // assert the two counts match
+}
 ```
-fix: unlink block before rebinning in find_suitable_block large-bin path
-fix: remove double pthread_mutex_unlock in my_malloc split branch
-refactor: merge coalesce sequentially (prev then next), fix missing unlinks
-feat: absorb top chunk in coalesce instead of double-merging it
-refactor: merge try_expand sequentially, fix missing next-block unlink
-feat: absorb top chunk in try_expand, fix needed-size underflow bug
-```
-(Note: the `gm.topsize` bugs in both top-chunk branches, and the
-`my_free` binning condition, are still open — commit those as separate
-fixes once resolved, don't fold into the commits above.)
+
+Also flagged:
+- `check_heap()`'s `next == gm.top_chunk` branch currently skips validation
+  entirely; should instead assert `!IS_FREE(curr)` (a free chunk adjacent to
+  top should never exist under aggressive coalescing).
+- No bound-check that `BLOCK_NEXT_HEADER(...)` result stays `<= gm.heap_end`
+  — a corrupted `payload` could walk past the end of the heap silently.
+
+---
+
+## Testing strategy discussed
+
+- Test incrementally by layer, not all-at-once: `heap_init` → top-carve
+  malloc (no bins) → free+coalesce (no bin insert) → bin insert/find →
+  grow/shrink. Don't jump to testing later layers before earlier ones are
+  verified independently.
+- Use `check_*()` debug assertions **after every operation** in tests, not
+  just at the end.
+- Build with `-DDEBUG -fsanitize=address -g`; Valgrind as a secondary check
+  for uninitialized-read bugs specifically.
+- **Caught mid-session:** `heap_init()` has a `static bool initialized`
+  guard that's correct for production but breaks multi-test-in-one-binary
+  setups — second+ calls silently no-op, so a second test function
+  unknowingly runs on the first test's leftover heap state. Two fixes
+  discussed:
+  1. One process per test binary (simplest, no product code changes).
+  2. A `#ifdef DEBUG`-gated `heap_reset_for_test()` that resets the
+     `initialized` flag — not yet added.
+- Bug-specific repro test sketches were drafted for Bug 1 and Bug 4
+  (malloc-only, no `free()` needed — safe to write now). Bug 2's repro
+  (three increasing-size large-bin frees, biggest freed last) depends on
+  `free()`/`insert_large_chunk()` being finished — **on hold**, user is
+  still finishing `my_free()`.
+
+---
+
+## Design discussion: top-chunk shrinking strategies
+
+Compared three real-world approaches (grounded via source/docs, not memory):
+
+1. **Fixed threshold** (dlmalloc default, and what this project currently
+   uses) — simple, no adaptation.
+2. **Adaptive/dynamic threshold** (glibc) — ratchets `mmap_threshold` up to
+   the size of the largest recently-freed block (capped at
+   `DEFAULT_MMAP_THRESHOLD_MAX`), with `trim_threshold = 2 × mmap_threshold`.
+   Real production bug found in glibc history (`BZ #17195`): inconsistent
+   threshold application across per-thread heaps caused ~9000 `madvise()`
+   calls/sec on a benchmark; fixing consistency dropped it to ~2 calls total
+   and ~4x'd throughput. This project's single-arena design sidesteps that
+   specific failure mode (no per-thread heaps), which is a genuine advantage
+   if adaptive thresholding is added later.
+3. **Decay-based purging** (jemalloc) — time-based (sigmoidal decay curve,
+   default 10s), purging decoupled from `free()` via background threads.
+   Requires infrastructure (background thread) this project doesn't have;
+   not recommended as a near-term direction.
+
+**Decision:** user is interested in adding a simplified version of strategy 2
+(ratchet-up-only, no decay/EMA) mainly for portfolio appeal, but agreed to
+finish and stabilize the four core bugs first before layering in adaptive
+threshold logic, since it touches the same `my_free()`/`topsize` code paths.
+
+---
+
+## Open items / next steps
+
+1. Finish `my_free()` (currently in progress — shrink section explicitly
+   unfinished).
+2. Fix Bug 2 (`insert_large_chunk` missing `break` + tail-insert fallback).
+3. Confirm Bug 4 one-line fix (`p->payload = request_size;`) is applied.
+4. Add `check_heap_bin_consistency()` to `debug.c`, plus the two smaller
+   `check_heap()` gaps (top-adjacency assert, bound-check).
+5. Decide on test isolation approach (separate binaries vs. `heap_reset_for_test()`).
+6. Write/run repro tests for Bug 1 and Bug 4 (safe now, malloc-only).
+7. After `my_free()` is stable: revisit Bug 3 (shrink logic), write Bug 2's
+   repro test, then consider the adaptive shrink-threshold feature.

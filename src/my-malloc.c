@@ -1,6 +1,11 @@
 #include "my-malloc.h"
 
-static malloc_state gm; // allocator state
+static malloc_state gm; // allocator state 
+
+#ifdef DEBUG
+const malloc_state *debug_get_state(void) { return &gm; }
+#endif
+
 static bool initialized = false;
 
 long g_sbrk_calls = 0;
@@ -534,14 +539,13 @@ void insert_large_chunk(mblockptr * chunk,size_t size) {
 
     while(pos != head) {
         mblockptr * pos_block = list_entry(pos, mblockptr, list);
-        mblockptr * next = pos->next;
-
+    
         // insert before to keep sorted list 
         if(chunk->payload < pos_block->payload) {
             list_add_before(pos,&chunk->list);
             return;
         }     
-        pos = next;
+        pos = pos->next;
     }
 
 }
