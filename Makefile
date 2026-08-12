@@ -102,9 +102,9 @@ s:
 thread:
 	gcc -pthread -std=c11 -Iinclude -g -O0 -o test/test_threads_helgrind src/my-malloc.c test/test_threads.c
 	valgrind --tool=helgrind --history-level=full ./test/test_threads_helgrind
-test_bug:
-	gcc -DDEBUG -fsanitize=address -g -Iinclude \
-    -o test/test_bugs \
-    test/test_bugs.c src/my-malloc.c src/debug.c
+
+bug:
+	gcc -DDEBUG -fsanitize=address -g -Iinclude -o test/test_bugs test/test_bugs.c src/my-malloc.c src/debug.c
+	./test/test_bugs
 clean:
 	rm -f $(TEST_BINS) $(BENCH_BIN)

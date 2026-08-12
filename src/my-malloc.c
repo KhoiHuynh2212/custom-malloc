@@ -43,7 +43,7 @@ void heap_init()
 
     gm.top_chunk = (mblockptr *)start;
 
-    size_t raw_payload = INITIAL_HEAP_SIZE - HEADER_SIZE - FOOTER_SIZE;
+    size_t raw_payload = INITIAL_HEAP_SIZE - HEADER_SIZE ;
 
     gm.top_chunk->payload = raw_payload & ~(ALIGN - 1);
     gm.topsize = gm.top_chunk->payload; // update the top size;

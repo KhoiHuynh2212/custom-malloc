@@ -45,6 +45,7 @@ dlmalloc — used for grounding design comparisons, not copied directly).
 | **4** | `my_malloc()` top-carve, line ~282 | `p->payload = needed` (where `needed = request_size + ALIGN_HEADER_FOOTER`, i.e. the chunk's *total footprint*) — should be `p->payload = request_size` (pure payload only), matching the convention used everywhere else in the file (`split()`, `try_expand()`, `heap_init()`). Causes `BLOCK_NEXT_HEADER` to compute the wrong location for the next chunk on every future heap walk touching this block (e.g. in `coalesce()` when it's later freed) — corrupts heap walking, not a rare edge case since it affects the main top-carve growth path. | ⏳ Open — one-line fix identified, not yet confirmed applied. |
 | — | `try_expand()` top-chunk branch | Same missing-header-init issue as Bug 1's second half. | ✅ Fixed — confirmed matches the corrected `my_malloc()` pattern. |
 | — | `coalesce()` | No bug — was already correct; it was only a victim of corrupted upstream state from Bugs 1/4. No changes needed. | ✅ Confirmed correct as-is. |
+| **5** | `heap_init()`, line ~41 | `raw_payload = INITIAL_HEAP_SIZE - HEADER_SIZE - FOOTER_SIZE` over-reserves by `FOOTER_SIZE` (16 bytes). Top chunk never has a footer (no chunk follows it in memory, consistent with `grow_top()` and `coalesce()`'s top-absorb branch, neither of which account for a footer on top). Caused `check_top_chunk()`'s invariant `(top_chunk+1) + topsize == heap_end` to fail immediately on init — off by exactly `FOOTER_SIZE`. Confirmed with real build+test run: `test_bugs: src/debug.c:18: check_top_chunk: Assertion ... failed`. | ✅ Fixed — user confirmed applying the one-line fix (`raw_payload = INITIAL_HEAP_SIZE - HEADER_SIZE;`, drop the `- FOOTER_SIZE`). |
 
 ---
 
@@ -73,6 +74,31 @@ Also flagged:
   — a corrupted `payload` could walk past the end of the heap silently.
 
 ---
+
+## Build/tooling notes (resolved this session)
+
+- `-DDEBUG` needs no space (`gcc - DDEBUG ...` is parsed as "read from stdin" +
+  a bogus input file named `DDEBUG` — a classic copy-paste spacing mistake).
+- Header include path: headers live in `include/`, sources in `src/`, tests
+  in `test/` — build needs `-Iinclude` regardless of which directory the
+  `.c` file being compiled lives in (quote-includes resolve relative to the
+  including file first, so `-I` is required for cross-directory access).
+- `gm` in `my-malloc.c` is `static` (file-scope only) by design, so
+  `debug.c` can't reference it directly. Resolved via a `pull + cache`
+  pattern:
+  - `my-malloc.c` exposes `const malloc_state *debug_get_state(void) { return &gm; }`
+    under `#ifdef DEBUG`, keeping `gm` itself `static`/encapsulated.
+  - `debug.c` caches the pointer once in a local `static const malloc_state *state`,
+    via an `ensure_state()` helper called at the top of every `check_*()`
+    function. Caching the *pointer* is safe since `gm`'s address never
+    changes (it's a static struct) — only its field values change, which
+    are read fresh through the pointer each time, not cached.
+- On some environments, `-fsanitize=address` failed to link
+  (`cannot find libasan.so.8.0.0`) — a missing/mismatched system package,
+  not a code or flag issue. Fix is `sudo apt install libasan8` (or the
+  matching major version for the installed `gcc`) / `sudo dnf install libasan`
+  depending on distro; Valgrind was suggested as a fallback if the package
+  can't be installed.
 
 ## Testing strategy discussed
 
@@ -127,15 +153,36 @@ threshold logic, since it touches the same `my_free()`/`topsize` code paths.
 
 ---
 
+## Current status (end of session)
+
+- `debug.c` is fully wired up (`ensure_state()` pattern) and building
+  successfully against `src/my-malloc.c` with the `-Iinclude` fix.
+- `check_top_chunk()` ran and immediately caught **Bug 5** (heap_init footer
+  over-reservation) — now fixed and confirmed by the user.
+- Bugs 1, 4, and the `try_expand`/`coalesce` fixes from earlier were reviewed
+  in code but **not yet re-verified against a passing test run** — the test
+  binary aborted on Bug 5 before reaching later checks (`check_heap`,
+  `check_bins`, `check_heap_bin_consistency`). Re-run the full test suite
+  now that Bug 5 is fixed to see whether Bugs 1/4 truly hold up, or whether
+  more init-layer issues are hiding behind them.
+- Bug 2 (`insert_large_chunk` lost-chunk) is still unfixed in code.
+- `check_heap_bin_consistency()` (the cross-check between heap-walk and
+  bin contents, designed to catch Bug 2) has been written and added to
+  `debug.c`, but hasn't caught anything yet since Bug 2 hasn't been
+  exercised (needs `my_free()` finished first).
+
 ## Open items / next steps
 
-1. Finish `my_free()` (currently in progress — shrink section explicitly
+1. Re-run the test suite now that Bug 5 is fixed — confirm `check_top_chunk`,
+   `check_heap` all pass on a fresh `heap_init()` + a few `malloc()` calls.
+2. Finish `my_free()` (currently in progress — shrink section explicitly
    unfinished).
-2. Fix Bug 2 (`insert_large_chunk` missing `break` + tail-insert fallback).
-3. Confirm Bug 4 one-line fix (`p->payload = request_size;`) is applied.
-4. Add `check_heap_bin_consistency()` to `debug.c`, plus the two smaller
-   `check_heap()` gaps (top-adjacency assert, bound-check).
-5. Decide on test isolation approach (separate binaries vs. `heap_reset_for_test()`).
-6. Write/run repro tests for Bug 1 and Bug 4 (safe now, malloc-only).
-7. After `my_free()` is stable: revisit Bug 3 (shrink logic), write Bug 2's
-   repro test, then consider the adaptive shrink-threshold feature.
+3. Fix Bug 2 (`insert_large_chunk` missing `break` + tail-insert fallback),
+   then exercise `check_heap_bin_consistency()` against it.
+4. Confirm Bug 4 one-line fix (`p->payload = request_size;`) is applied and
+   passes `check_heap()` on a top-carved-then-freed chunk.
+5. Decide on test isolation approach (separate binaries vs. `heap_reset_for_test()`)
+   — needed once more than one test function shares a binary.
+6. After `my_free()` is stable: revisit Bug 3 (shrink logic), then consider
+   the adaptive shrink-threshold feature (ratchet-up-only, glibc-style,
+   deferred until core bugs are stable).
