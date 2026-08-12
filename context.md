@@ -1,188 +1,180 @@
-# Custom Allocator (`my-malloc`) — Session Context
+# Custom Allocator (`my-malloc`) — Session 2 Context
 
-Handoff notes from a mentoring/code-review session on a custom `malloc`/`free`
-implementation. Architecture: **array-based bins with sorted linked lists**
-(no tree — an intentional, fixed constraint of this project), loosely modeled
-on dlmalloc's design but adapted throughout since the tree-bin approach isn't
-available here.
+Handoff notes from a mentoring/debugging session focused on **top-chunk
+shrink-to-OS logic** and **`free()` correctness**. Continues directly from
+the prior session's context (bugs 1–5, `debug.c` wiring, testing strategy).
 
-Reference implementation studied alongside this project:
-`https://github.com/KhoiHuynh2212/dlmalloc/` (a modularized fork of Doug Lea's
-dlmalloc — used for grounding design comparisons, not copied directly).
-
----
-
-## Architecture summary
-
-- `bin_map_t`-style bitmap concept discussed (dlmalloc reference), but **not
-  needed** in this project — bins here use `list_is_empty()` for O(1)
-  "is this bin empty" checks, so no bitmap layer was added.
-- Small bins: fixed-size buckets, O(1) insert (push front) and O(1) delete
-  (splice via existing `fd`/`bk`, no search).
-- Large bins: sorted linked list per bucket (`get_bin_bucket()` ranges).
-  Insert is O(n) to find sort position; delete is still O(1) once you already
-  have the chunk pointer (no search needed — this was a point of confusion
-  earlier in the session, since it's a common misconception that delete is
-  also O(n)).
-- `top_chunk` / `topsize`: must always satisfy the invariant
-  `top_chunk->payload == topsize`. Several bugs stemmed from this invariant
-  being silently violated.
-- `MIN_CHUNK_SIZE` in this project's header struct = 32 bytes, which is why
-  `bins[0]` (and possibly `bins[1]`, depending on whether `small_index()` is
-  fed payload-only or total chunk size) is structurally unreachable — this is
-  expected/normal, matches the same phenomenon in dlmalloc's own small bin
-  array, not a bug.
+Corrected file from this session: `/mnt/user-data/outputs/my-malloc.c`
+(passes the full regression suite described below — **this is the version
+to commit**, not any file re-uploaded mid-session, which repeatedly reverted
+to a pre-fix state).
 
 ---
 
-## Bugs found this session
+## Design decision made this session
+
+Compared **fixed shrink threshold** (dlmalloc-style, static) vs **dynamic/
+adaptive threshold** (glibc-style, ratchet-up-only, ties to `mmap_threshold`
+history). Grounded via real source: dlmalloc's `M_TRIM_THRESHOLD` default
+(2 MB, static) and glibc's dynamic-threshold patch (ratchets up on large
+frees, `trim_threshold = 2 × mmap_threshold`, capped at
+`DEFAULT_MMAP_THRESHOLD_MAX`).
+
+**Decision: keep fixed threshold.** User reasoned through the tradeoff
+independently — a ratchet-up-only dynamic threshold would over-retain memory
+after a setup-phase burst allocation followed by small-object churn, which
+matches this project's likely workload shape. Correct call, not revisited.
+
+---
+
+## Bugs found and fixed this session
+
+All fixes verified with a real test suite (see below), not just code review.
 
 | # | Location | Description | Status |
 |---|---|---|---|
-| **1** | `grow_top()` + `my_malloc()` top-carve path | `grow_top()` updated `top_chunk->payload` but never `gm.topsize`; `my_malloc()` then overwrote `payload` and subtracted `needed` from the **stale** `topsize` → unsigned integer underflow, `topsize` becomes a huge garbage value. Also: newly split-off top chunk's header (`payload`/`flags`/`SET_FREE`) was never initialized. | ✅ Fixed — `grow_top()` now does `gm.topsize = gm.top_chunk->payload;` after growing; `my_malloc()` now initializes the new top chunk's header fields explicitly. |
-| **2** | `insert_large_chunk()` | Loop never `break`s/`return`s after insertion (risk of double-splice), and has **no fallback insert-at-tail** — if the freed chunk is larger than every existing entry in its bin, it's silently never inserted anywhere. Chunk becomes an unreachable "leak" in the allocator's own bookkeeping. | ⏳ Open — not yet fixed. |
-| **3** | `my_free()` shrink-to-OS block | Uses `survivor` (an arbitrary just-coalesced chunk, guaranteed *not* to be `top_chunk` since that case returns early) instead of `gm.top_chunk`/`gm.topsize` to compute `new_break`. Only valid if `survivor` happens to be adjacent to `heap_end`, which isn't checked. | ⏳ **Not actually a bug** — user confirmed this section of `free()` is unfinished/mid-refactor, not a landed defect. Revisit once shrink logic is completed. |
-| **4** | `my_malloc()` top-carve, line ~282 | `p->payload = needed` (where `needed = request_size + ALIGN_HEADER_FOOTER`, i.e. the chunk's *total footprint*) — should be `p->payload = request_size` (pure payload only), matching the convention used everywhere else in the file (`split()`, `try_expand()`, `heap_init()`). Causes `BLOCK_NEXT_HEADER` to compute the wrong location for the next chunk on every future heap walk touching this block (e.g. in `coalesce()` when it's later freed) — corrupts heap walking, not a rare edge case since it affects the main top-carve growth path. | ⏳ Open — one-line fix identified, not yet confirmed applied. |
-| — | `try_expand()` top-chunk branch | Same missing-header-init issue as Bug 1's second half. | ✅ Fixed — confirmed matches the corrected `my_malloc()` pattern. |
-| — | `coalesce()` | No bug — was already correct; it was only a victim of corrupted upstream state from Bugs 1/4. No changes needed. | ✅ Confirmed correct as-is. |
-| **5** | `heap_init()`, line ~41 | `raw_payload = INITIAL_HEAP_SIZE - HEADER_SIZE - FOOTER_SIZE` over-reserves by `FOOTER_SIZE` (16 bytes). Top chunk never has a footer (no chunk follows it in memory, consistent with `grow_top()` and `coalesce()`'s top-absorb branch, neither of which account for a footer on top). Caused `check_top_chunk()`'s invariant `(top_chunk+1) + topsize == heap_end` to fail immediately on init — off by exactly `FOOTER_SIZE`. Confirmed with real build+test run: `test_bugs: src/debug.c:18: check_top_chunk: Assertion ... failed`. | ✅ Fixed — user confirmed applying the one-line fix (`raw_payload = INITIAL_HEAP_SIZE - HEADER_SIZE;`, drop the `- FOOTER_SIZE`). |
+| **6** | `my_malloc()` top-carve, growth check | `if (request_size >= gm.topsize)` compared raw payload against `topsize`, ignoring that the actual footprint needed is `request_size + ALIGN_HEADER_FOOTER`. When `topsize` sat between those two values, the allocator wrongly skipped `grow_top()`, then `gm.topsize -= needed` underflowed (`size_t`), sending `gm.top_chunk` walking past `heap_end` into unmapped memory. Reproduced live via a sawtooth test (`i=31` in a 50-alloc loop). | ✅ Fixed — `if (request_size + ALIGN_HEADER_FOOTER >= gm.topsize)`. |
+| **7** | `insert_large_chunk()` | Confirmed bug 2 from session 1 is a **real crash bug**, not just a silent leak: chunks carved from top never had `list_init()` called on their `->list` member. Combined with the missing fallback insert, an "orphaned" chunk kept `list.next/prev == NULL` (zero-filled fresh `sbrk` pages). The next `free()` that coalesced with it as `prev` called `list_unlink()` on a non-self-linked NULL node → segfault. Reproduced live, traced to exact `free(ptrs[1])` call via `check_heap()`/`check_bins()` bisection. | ✅ Fixed two ways: (a) added fallback tail-insert (`list_add_before(head, ...)`) after the sorted-insert loop in `insert_large_chunk()`; (b) added `list_init(&block->list)` in `my_free()` right after `SET_FREE(block)`, before `coalesce()`, so any freed block is always in a valid detached-or-linked state. |
+| **8** | `my_free()`, shrink-check placement | `if (survivor == gm.top_chunk) { unlock; return; }` returned **before** reaching the `SHRINK_THRESHOLD` check. Since freeing memory that coalesces directly into the top chunk is the most common case (ascending-address frees, typical LIFO-ish patterns), shrink almost never fired in practice — this is what looked like "shrink keeps topsize at default" but was actually "shrink rarely runs at all." Verified via `/proc/self/statm`: `heap_end` didn't move after freeing 800 KB in one test run. | ✅ Fixed — restructured so the bin-insert step is skipped when `survivor == top_chunk` (correct, top isn't binned), but the shrink-threshold check always runs afterward regardless of which branch was taken. |
+| **9** | `my_free()`, shrink payload recompute | Original: `gm.topsize = new_break - survivor - HEADER_SIZE - FOOTER_SIZE` (bug 3 from session 1, now confirmed as a real defect, not "unfinished code"). Two problems: (a) used `survivor` (whichever chunk triggered the free) instead of `gm.top_chunk`/`gm.topsize`, wrong reference point when `survivor != top_chunk`; (b) subtracted `FOOTER_SIZE`, which reintroduces bug 5's mistake — **the top chunk never has a footer**, so the correct invariant is `(top_chunk+1) + topsize == heap_end`, no `-FOOTER_SIZE`. This bug was invisible to `check_heap()`/`check_bins()` since neither validates the top-chunk invariant; only caught once `check_top_chunk()` was called after a shrink event. | ✅ Fixed — `gm.top_chunk->payload = new_break - (uintptr_t)gm.top_chunk - HEADER_SIZE;` then `gm.topsize = gm.top_chunk->payload;`. Always derived from the actual `new_break`, never hardcoded. |
+| **10** (rejected variant) | Same shrink block | User proposed `gm.top_chunk->payload = INITIAL_TOP_SIZE; // simply reset?` on the reasoning that shrink "resets to default." Disproved with two tests: (a) even in the all-freed case, the correct value is off from `INITIAL_TOP_SIZE` by `HEADER_SIZE` bytes (units mismatch — `INITIAL_TOP_SIZE` is an address offset, `payload` is a size net of header); (b) with a live allocation present below top, the natural (unclamped) `new_break` sits **above** the floor entirely, so the floor is never touched and the real payload is nowhere near `INITIAL_TOP_SIZE`. Root confusion identified: conflating **floor** (absolute lower bound anchored to `heap_start`, safety net) with **pad** (relative slack anchored to `top_chunk`, the actual shrink target) — they only coincide in the special case `top_chunk == heap_start`. | ❌ Rejected, not applied. Diagrammed for the user to build intuition; user hit a wall mid-explanation and chose to stop here rather than push through confused. **Revisit this floor-vs-pad distinction first thing next session**, probably with a fresh, simpler diagram before touching code again. |
+
+### Naming cleanup (also this session)
+- Replaced the shrink floor's reuse of `MMAP_THRESHOLD` (coincidental,
+  unrelated constant) with a new, purpose-built `INITIAL_TOP_SIZE` macro in
+  `my-malloc.h`, defined as `INITIAL_HEAP_SIZE` (so `heap_start +
+  INITIAL_TOP_SIZE` exactly equals the original post-`heap_init()`
+  `heap_end`). Good improvement, orthogonal to bug 10 above — the *name* is
+  fixed, the *usage* (floor vs pad conflation) is not yet resolved.
 
 ---
 
-## `debug.c` / `debug.h` review
+## Test infrastructure built this session (not yet copied into the project's `test/` dir)
 
-Existing checks (`check_top_chunk`, `check_bins`, `check_heap`) are a solid
-foundation but have a coverage gap: **nothing cross-validates that every
-free chunk found by walking the heap actually appears in some bin.** This
-gap is exactly what would let Bug 2 (lost large chunk) pass silently.
+All ad hoc so far, written and run in a scratch dir against copies of the
+project's real sources. **Not yet persisted to the actual project** — next
+session should decide where these live permanently (likely `test/`).
 
-Proposed addition (not yet added to the file):
-```c
-void check_heap_bin_consistency(void)
-{
-    // walk heap, count free chunks (excluding top)
-    // walk all gm.bins[], count total via list_length()
-    // assert the two counts match
-}
-```
+1. **`test_sawtooth.c`** — perf-oriented: allocs/frees a batch of same-size
+   chunks in a loop, tracks `g_sbrk_calls` (existing counter) and peak RSS
+   via `getrusage()`. Revealed that same-size batch frees fully coalesce
+   into one reusable block, so `sbrk_calls` stays at 1 — this pattern does
+   **not** actually exercise the shrink path repeatedly. Useful baseline,
+   not sufficient alone.
+2. **`test_sawtooth_debug2.c`** — correctness-oriented: same shape, but
+   calls `check_heap()`/`check_bins()` after every single `my_malloc`/
+   `my_free` call, built with `-DDEBUG -fsanitize=address`. This is the
+   workhorse that caught bugs 6 and 7 — bisected by adding per-call print
+   tracing (`i=%d ptr=%p`) until the exact failing call was isolated.
+3. **`test_floor.c`** — allocates a big batch, frees it all, checks
+   `/proc/self/statm` RSS and `heap_end` before/after, plus
+   `check_top_chunk()`. Caught bug 9 (the missing/wrong invariant after
+   shrink) — this was the first test in the whole project to call
+   `check_top_chunk()` after anything other than `heap_init()`.
+4. **`test_reset_claim2/3.c`** — persistent-allocation variants used to
+   disprove the "shrink resets to default" claim (bug 10). Also stumbled
+   into an **unresolved, non-deterministic crash** (see below) — found by
+   accident while building these, not fully diagnosed.
 
-Also flagged:
-- `check_heap()`'s `next == gm.top_chunk` branch currently skips validation
-  entirely; should instead assert `!IS_FREE(curr)` (a free chunk adjacent to
-  top should never exist under aggressive coalescing).
-- No bound-check that `BLOCK_NEXT_HEADER(...)` result stays `<= gm.heap_end`
-  — a corrupted `payload` could walk past the end of the heap silently.
-
----
-
-## Build/tooling notes (resolved this session)
-
-- `-DDEBUG` needs no space (`gcc - DDEBUG ...` is parsed as "read from stdin" +
-  a bogus input file named `DDEBUG` — a classic copy-paste spacing mistake).
-- Header include path: headers live in `include/`, sources in `src/`, tests
-  in `test/` — build needs `-Iinclude` regardless of which directory the
-  `.c` file being compiled lives in (quote-includes resolve relative to the
-  including file first, so `-I` is required for cross-directory access).
-- `gm` in `my-malloc.c` is `static` (file-scope only) by design, so
-  `debug.c` can't reference it directly. Resolved via a `pull + cache`
-  pattern:
-  - `my-malloc.c` exposes `const malloc_state *debug_get_state(void) { return &gm; }`
-    under `#ifdef DEBUG`, keeping `gm` itself `static`/encapsulated.
-  - `debug.c` caches the pointer once in a local `static const malloc_state *state`,
-    via an `ensure_state()` helper called at the top of every `check_*()`
-    function. Caching the *pointer* is safe since `gm`'s address never
-    changes (it's a static struct) — only its field values change, which
-    are read fresh through the pointer each time, not cached.
-- On some environments, `-fsanitize=address` failed to link
-  (`cannot find libasan.so.8.0.0`) — a missing/mismatched system package,
-  not a code or flag issue. Fix is `sudo apt install libasan8` (or the
-  matching major version for the installed `gcc`) / `sudo dnf install libasan`
-  depending on distro; Valgrind was suggested as a fallback if the package
-  can't be installed.
-
-## Testing strategy discussed
-
-- Test incrementally by layer, not all-at-once: `heap_init` → top-carve
-  malloc (no bins) → free+coalesce (no bin insert) → bin insert/find →
-  grow/shrink. Don't jump to testing later layers before earlier ones are
-  verified independently.
-- Use `check_*()` debug assertions **after every operation** in tests, not
-  just at the end.
-- Build with `-DDEBUG -fsanitize=address -g`; Valgrind as a secondary check
-  for uninitialized-read bugs specifically.
-- **Caught mid-session:** `heap_init()` has a `static bool initialized`
-  guard that's correct for production but breaks multi-test-in-one-binary
-  setups — second+ calls silently no-op, so a second test function
-  unknowingly runs on the first test's leftover heap state. Two fixes
-  discussed:
-  1. One process per test binary (simplest, no product code changes).
-  2. A `#ifdef DEBUG`-gated `heap_reset_for_test()` that resets the
-     `initialized` flag — not yet added.
-- Bug-specific repro test sketches were drafted for Bug 1 and Bug 4
-  (malloc-only, no `free()` needed — safe to write now). Bug 2's repro
-  (three increasing-size large-bin frees, biggest freed last) depends on
-  `free()`/`insert_large_chunk()` being finished — **on hold**, user is
-  still finishing `my_free()`.
+**Key testing lesson reinforced**: `check_heap()` and `check_bins()` do not
+validate the top-chunk invariant at all (they stop iterating once they
+reach `top_chunk`, and never inspect its own payload against `heap_end`).
+Every code path that touches `gm.topsize` or `gm.top_chunk` — `grow_top()`,
+top-carve in `my_malloc()`, and the shrink block in `my_free()` — needs
+`check_top_chunk()` run against it specifically, not just the general
+heap/bin checks.
 
 ---
 
-## Design discussion: top-chunk shrinking strategies
+## Open item: unresolved non-deterministic crash (found, not fixed)
 
-Compared three real-world approaches (grounded via source/docs, not memory):
+While testing bug 10 with a persistent 200 KB allocation kept alive across
+a shrink event: a segfault occurred in some builds/runs and not others
+(same source, same test, differing only by presence of
+`-fsanitize=address` or minor unrelated code changes in the test harness
+around it — classic UB fingerprint, not flakiness). Isolated so far:
 
-1. **Fixed threshold** (dlmalloc default, and what this project currently
-   uses) — simple, no adaptation.
-2. **Adaptive/dynamic threshold** (glibc) — ratchets `mmap_threshold` up to
-   the size of the largest recently-freed block (capped at
-   `DEFAULT_MMAP_THRESHOLD_MAX`), with `trim_threshold = 2 × mmap_threshold`.
-   Real production bug found in glibc history (`BZ #17195`): inconsistent
-   threshold application across per-thread heaps caused ~9000 `madvise()`
-   calls/sec on a benchmark; fixing consistency dropped it to ~2 calls total
-   and ~4x'd throughput. This project's single-arena design sidesteps that
-   specific failure mode (no per-thread heaps), which is a genuine advantage
-   if adaptive thresholding is added later.
-3. **Decay-based purging** (jemalloc) — time-based (sigmoidal decay curve,
-   default 10s), purging decoupled from `free()` via background threads.
-   Requires infrastructure (background thread) this project doesn't have;
-   not recommended as a near-term direction.
+- The 200 KB "persistent" allocation actually goes through the **mmap
+  path** (`>= MMAP_THRESHOLD` = 128 KB), not the sbrk heap, which
+  invalidated the original test design (intended to keep a live block
+  *inside* the sbrk heap, below `top_chunk`).
+- Crash trace pointed at `my_free(persistent)` (the `munmap()` call) or
+  immediately around it — not yet confirmed which.
+- ASan builds did **not** reproduce it; plain `-O0 -DDEBUG` builds did,
+  consistently across multiple runs. This suggests something ASan's
+  instrumentation masks or shifts (stack layout, possibly), rather than
+  true nondeterminism — worth a `gdb` session or `-fsanitize=undefined` run
+  next time, not more ad hoc printf bisection.
 
-**Decision:** user is interested in adding a simplified version of strategy 2
-(ratchet-up-only, no decay/EMA) mainly for portfolio appeal, but agreed to
-finish and stabilize the four core bugs first before layering in adaptive
-threshold logic, since it touches the same `my_free()`/`topsize` code paths.
+**Next session: dedicate focused time to this before anything else touches
+`my_free()` again** — don't layer more changes on top of a codebase with a
+known-but-uncharacterized crash.
 
 ---
 
-## Current status (end of session)
+## Current status (end of session 2)
 
-- `debug.c` is fully wired up (`ensure_state()` pattern) and building
-  successfully against `src/my-malloc.c` with the `-Iinclude` fix.
-- `check_top_chunk()` ran and immediately caught **Bug 5** (heap_init footer
-  over-reservation) — now fixed and confirmed by the user.
-- Bugs 1, 4, and the `try_expand`/`coalesce` fixes from earlier were reviewed
-  in code but **not yet re-verified against a passing test run** — the test
-  binary aborted on Bug 5 before reaching later checks (`check_heap`,
-  `check_bins`, `check_heap_bin_consistency`). Re-run the full test suite
-  now that Bug 5 is fixed to see whether Bugs 1/4 truly hold up, or whether
-  more init-layer issues are hiding behind them.
-- Bug 2 (`insert_large_chunk` lost-chunk) is still unfixed in code.
-- `check_heap_bin_consistency()` (the cross-check between heap-walk and
-  bin contents, designed to catch Bug 2) has been written and added to
-  `debug.c`, but hasn't caught anything yet since Bug 2 hasn't been
-  exercised (needs `my_free()` finished first).
+- `my-malloc.c` in `/mnt/user-data/outputs/` has bugs 6, 7, 8, 9 fixed and
+  verified (sawtooth regression × 500 rounds with ASan, `check_top_chunk`
+  passing after shrink). **This is the version to commit.**
+- Bug 2/7's fallback-insert fix means `insert_large_chunk()` is now
+  believed correct, but has not been stress-tested with a workload that
+  actually populates a large bin with 2+ entries and forces sort-position
+  insertion in the middle (all repro tests so far only exercised the
+  empty-bin fallback path).
+- The floor-vs-pad conceptual conflation (bug 10 area) is understood by
+  Claude and diagrammed, but **not yet internalized by the user** — flagged
+  explicitly as unfinished, not swept under the rug.
+- Test files exist only in a scratch environment this session, not
+  committed to the project's `test/` directory.
 
 ## Open items / next steps
 
-1. Re-run the test suite now that Bug 5 is fixed — confirm `check_top_chunk`,
-   `check_heap` all pass on a fresh `heap_init()` + a few `malloc()` calls.
-2. Finish `my_free()` (currently in progress — shrink section explicitly
-   unfinished).
-3. Fix Bug 2 (`insert_large_chunk` missing `break` + tail-insert fallback),
-   then exercise `check_heap_bin_consistency()` against it.
-4. Confirm Bug 4 one-line fix (`p->payload = request_size;`) is applied and
-   passes `check_heap()` on a top-carved-then-freed chunk.
-5. Decide on test isolation approach (separate binaries vs. `heap_reset_for_test()`)
-   — needed once more than one test function shares a binary.
-6. After `my_free()` is stable: revisit Bug 3 (shrink logic), then consider
-   the adaptive shrink-threshold feature (ratchet-up-only, glibc-style,
-   deferred until core bugs are stable).
+1. **Resume the floor-vs-pad distinction** from a clean state next session
+   — the diagram exists in this conversation's history if needed, but
+   probably better to re-derive it fresh once rested.
+2. Diagnose the non-deterministic crash (persistent mmap'd block + shrink)
+   properly — `gdb`, or `-fsanitize=undefined`, not printf bisection.
+3. Decide on a permanent home for the test files built this session
+   (`test_sawtooth.c`, `test_sawtooth_debug2.c`, `test_floor.c`) — likely
+   `test/`, per the project's existing `src/`/`include/`/`test/` layout.
+4. Stress-test `insert_large_chunk()`'s sorted-insert-in-the-middle path
+   specifically (not just the empty-bin fallback).
+5. Everything from session 1 that was still open remains open: test
+   isolation strategy (`heap_reset_for_test()` vs one-process-per-test),
+   and Bug 2's original repro sketch (now largely superseded by the
+   sawtooth/debug tests built this session).
+
+---
+
+## Suggested commit for today
+
+```
+fix: correct top-chunk growth check, orphaned-chunk crash, and shrink logic
+
+- my_malloc(): compare full chunk footprint (payload + header/footer),
+  not raw payload, against topsize before deciding to grow_top().
+  Prevents unsigned underflow that walked top_chunk past heap_end.
+- insert_large_chunk(): add missing fallback tail-insert when a freed
+  chunk is >= every existing entry in its bin (was previously silently
+  dropped, orphaning the chunk).
+- my_free(): list_init() a block's list node before coalesce/insert,
+  so a subsequent coalesce() against it as `prev` doesn't dereference
+  an uninitialized (non-self-linked) node.
+- my_free(): shrink-threshold check no longer skipped when the freed
+  chunk merges directly into top_chunk (previously an early return
+  bypassed shrink entirely in the most common coalescing case).
+- my_free(): shrink recompute now derives topsize from the actual
+  new_break and top_chunk address instead of a stale/wrong reference
+  chunk, and no longer over-subtracts FOOTER_SIZE (top chunk has no
+  footer).
+- my-malloc.h: rename shrink floor constant from a reused MMAP_THRESHOLD
+  to a purpose-built INITIAL_TOP_SIZE.
+
+Verified: 500-round sawtooth regression with check_heap()/check_bins()
+after every op under ASan; check_top_chunk() passes after shrink events
+at and away from the floor.
+
+Known open issue (not in this commit): non-deterministic crash under a
+persistent mmap'd allocation + shrink combo, not yet root-caused.
+```

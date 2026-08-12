@@ -24,6 +24,11 @@ void test_top_carve_payload_matches_request(void)
     printf("test_top_carve_payload_matches_request: PASS\n");
 }
 
+
+void test_shrink_threshold() {
+    
+}
+
 int main() {
     test_grow_top_topsize_stays_synced();
     test_top_carve_payload_matches_request();

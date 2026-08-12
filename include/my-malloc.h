@@ -40,7 +40,7 @@ typedef struct Block_Header
 #define CHUNK_SIZE ((size_t)64U * (size_t)1024U) // Chunk size is 64 KB
 #define SHRINK_KEEP (CHUNK_SIZE / (size_t)4U)    //
 #define LINUX_PAGE sysconf(_SC_PAGESIZE)
-#define INITIAL_HEAP_SIZE ((size_t)64U * (size_t)1024U)
+#define INITIAL_TOP_SIZE ((size_t)64U * (size_t)1024U)
 #define SMALL_BIN_MAX 1024
 #define NUM_SMALL_BINS 64
 #define LARGE_BIN_MIN_EXP 10 // 2^ 10 = 1024
@@ -54,7 +54,7 @@ typedef struct Block_Header
 
 #define REQUEST_CHUNK(s) ((s) + (HEADER_SIZE) + (FOOTER_SIZE))
 #define ABSORB(s) (REQUEST_CHUNK(s))
-#define MMAP_THRESHOLD 128 * 1024 // Trigger mmap allocation
+#define MMAP_THRESHOLD ((size_t)128U * (size_t)1024U) // Trigger mmap allocation
 
 /** Shrink threshold must stay strictly greater than one grow_top() increment
 (CHUNK_SIZE) to avoid heap "flapping": growing by CHUNK_SIZE then
