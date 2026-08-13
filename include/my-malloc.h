@@ -38,7 +38,7 @@ typedef struct Block_Header
 } mblockptr; // block header structure 
 
 #define CHUNK_SIZE ((size_t)64U * (size_t)1024U) // Chunk size is 64 KB
-#define SHRINK_KEEP (CHUNK_SIZE / (size_t)4U)    //
+#define TOP_PAD_SIZE (CHUNK_SIZE / (size_t)4U)    //
 #define LINUX_PAGE sysconf(_SC_PAGESIZE)
 #define INITIAL_TOP_SIZE ((size_t)64U * (size_t)1024U)
 #define SMALL_BIN_MAX 1024
@@ -73,7 +73,7 @@ automatically if CHUNK_SIZE is retuned. Currently: 2 * 64 KB = 128 KB.
 
 
 typedef struct malloc_state {
-    mblockptr *top_chunk; 
+    mblockptr *topchunkptr; 
     list bins[NUM_BINS];
     size_t topsize; 
     char *heap_start;

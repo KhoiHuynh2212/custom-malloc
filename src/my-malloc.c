@@ -41,16 +41,16 @@ void heap_init()
         list_init(&gm.bins[i]);
     }
 
-    gm.top_chunk = (mblockptr *)start;
+    gm.topchunkptr = (mblockptr *)start;
 
     size_t raw_payload = INITIAL_TOP_SIZE - HEADER_SIZE;
 
-    gm.top_chunk->payload = raw_payload & ~(ALIGN - 1);
-    gm.topsize = gm.top_chunk->payload; // update the top size;
-    gm.top_chunk->flags = 0;
-    SET_FREE(gm.top_chunk);
+    gm.topchunkptr->payload = raw_payload & ~(ALIGN - 1);
+    gm.topsize = gm.topchunkptr->payload; // update the top size;
+    gm.topchunkptr->flags = 0;
+    SET_FREE(gm.topchunkptr);
 
-    list_init(&gm.top_chunk->list);
+    list_init(&gm.topchunkptr->list);
 
     initialized = true; // turn the flag on
     pthread_mutex_unlock(&global_lock);
@@ -125,7 +125,7 @@ mblockptr *find_suitable_block(size_t request_size)
 // extend the program break by asking OS to give big chunk of memory and assume the top chunk already exists
 mblockptr *grow_top(size_t size)
 {
-    if (gm.top_chunk == NULL)
+    if (gm.topchunkptr == NULL)
     {
         return NULL;
     }
@@ -139,10 +139,10 @@ mblockptr *grow_top(size_t size)
         return NULL;
     }
 
-    gm.top_chunk->payload += allocate_size;
-    gm.topsize = gm.top_chunk->payload;
+    gm.topchunkptr->payload += allocate_size;
+    gm.topsize = gm.topchunkptr->payload;
     gm.heap_end = (char *)request + allocate_size;
-    return gm.top_chunk;
+    return gm.topchunkptr;
 }
 
 mblockptr *split(mblockptr *block, size_t request_size)
@@ -188,14 +188,14 @@ mblockptr *coalesce(mblockptr *curr)
     mblockptr *next = BLOCK_NEXT_HEADER(curr, curr->payload);
 
     // the next block is top chunk, absorb to top chunk
-    if (next == gm.top_chunk)
+    if (next == gm.topchunkptr)
     {
 
         curr->payload += ABSORB(next->payload);
 
         gm.topsize = curr->payload;
 
-        gm.top_chunk = curr;
+        gm.topchunkptr = curr;
 
         return curr;
     }
@@ -213,7 +213,7 @@ mblockptr *coalesce(mblockptr *curr)
 
 void *my_malloc(size_t size)
 {
-    if (gm.top_chunk == NULL)
+    if (gm.topchunkptr == NULL)
     {
         heap_init();
     }
@@ -281,18 +281,18 @@ void *my_malloc(size_t size)
                 }
             }
 
-            mblockptr *p = gm.top_chunk; // start at old top
+            mblockptr *p = gm.topchunkptr; // start at old top
             size_t needed = request_size + ALIGN_HEADER_FOOTER;
             p->payload = request_size;
             SET_ALLOCATED(p);
             set_footer(p);
 
             gm.topsize -= needed;
-            gm.top_chunk = BLOCK_NEXT_HEADER(p, request_size); // bump request byte
+            gm.topchunkptr = BLOCK_NEXT_HEADER(p, request_size); // bump request byte
 
-            gm.top_chunk->payload = gm.topsize;
-            gm.top_chunk->flags = 0;
-            SET_FREE(gm.top_chunk);
+            gm.topchunkptr->payload = gm.topsize;
+            gm.topchunkptr->flags = 0;
+            SET_FREE(gm.topchunkptr);
 
             curr_block = p;
         }
@@ -344,7 +344,7 @@ mblockptr *try_expand(mblockptr *curr, size_t new_payload)
     // TODO : gm.topchunk case
     mblockptr *next = BLOCK_NEXT_HEADER(curr, curr->payload);
 
-    if (next == gm.top_chunk)
+    if (next == gm.topchunkptr)
     {
 
         if (new_payload >= gm.topsize)
@@ -361,10 +361,10 @@ mblockptr *try_expand(mblockptr *curr, size_t new_payload)
         set_footer(curr); // re-calculate the footer
 
         mblockptr *np = BLOCK_NEXT_HEADER(curr, curr->payload);
-        gm.top_chunk = np;
-        gm.top_chunk->payload = gm.topsize;
-        gm.top_chunk->flags = 0;
-        SET_FREE(gm.top_chunk);
+        gm.topchunkptr = np;
+        gm.topchunkptr->payload = gm.topsize;
+        gm.topchunkptr->flags = 0;
+        SET_FREE(gm.topchunkptr);
         return curr;
     }
 
@@ -553,6 +553,7 @@ void insert_large_chunk(mblockptr *chunk, size_t size)
         pos = pos->next;
     }
 }
+static_assert(TOP_PAD_SIZE < SHRINK_THRESHOLD, "shrink pad must be smaller than trigger threshold");
 
 void my_free(void *ptr)
 {
@@ -584,7 +585,7 @@ void my_free(void *ptr)
         list_init(&block->list);
         mblockptr *survivor = coalesce(block);
 
-        if (survivor != gm.top_chunk)
+        if (survivor != gm.topchunkptr)
         {
 
             size_t final_size = survivor->payload;
@@ -606,26 +607,22 @@ void my_free(void *ptr)
 
         if (gm.topsize >= SHRINK_THRESHOLD) // so shrink at double initial top size = 128 KB
         {
-            uintptr_t floor = (uintptr_t)gm.heap_start + INITIAL_TOP_SIZE;           // 64Kb default
-            uintptr_t new_break = (uintptr_t)gm.heap_end - gm.topsize + SHRINK_KEEP; // keep only 16KB
 
-            // Clamp to the floor
-            if (new_break < floor)
-            {
-                new_break = floor; // claim the floor so always 64 KB
-            }
+            uintptr_t next_topchunkptr = (uintptr_t)gm.topchunkptr + HEADER_SIZE + TOP_PAD_SIZE; // keep only 16KB
 
             // Calculate actual bytes to give back
-            size_t actual_shrink_amt = (uintptr_t)gm.heap_end - new_break; // 128 - 64 = 64 KB
+            size_t actual_shrink_amt = (uintptr_t)gm.heap_end - next_topchunkptr;
 
             if (actual_shrink_amt > 0)
             {
 
-                // Calculate the new payload size based on the actual new break
-                gm.top_chunk->payload = (size_t)(new_break - (uintptr_t)gm.top_chunk - HEADER_SIZE);
-                gm.topsize = gm.top_chunk->payload;
-                gm.heap_end = (char *)new_break; // set as default
-                sbrk(-(intptr_t)actual_shrink_amt);
+                if (sbrk(-(intptr_t)actual_shrink_amt) != (void *)-1)
+                {
+                    // Calculate the new payload size based on the actual new break
+                    gm.topchunkptr->payload = TOP_PAD_SIZE;
+                    gm.topsize = gm.topchunkptr->payload;
+                    gm.heap_end = (char *)next_topchunkptr;
+                }
             }
         }
         s = pthread_mutex_unlock(&global_lock);
