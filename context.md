@@ -1,255 +1,196 @@
-# Custom Allocator (`my-malloc`) — Session 3 Context
+# Custom Allocator (`my-malloc`) — Session 5 Context
 
-Continues directly from Session 2's context (bugs 1–9 fixed, bug 10 —
-floor-vs-pad — left explicitly unresolved as the first item for this
-session). This session resolved it, but along the way surfaced a new,
-real, unfixed bug in the same shrink block. **Nothing in this session's
-findings has been applied to code yet** — `/mnt/user-data/uploads/my-malloc.c`
-already contains the floor-removal redesign the user wrote independently;
-the sbrk-ordering fix discussed below is not yet in that file.
-
----
-
-## Session 3 starting point
-
-User uploaded a new `my-malloc.c` with an independent redesign of the
-shrink block, plus a field rename (`gm.top_chunk` → `gm.topchunkptr`,
-applied consistently across `heap_init`, `grow_top`, `coalesce`,
-`my_malloc`, `try_expand`, `my_free`). Diffed against the project copy to
-confirm scope — rename only, no other unrelated drift.
+Continues directly from Session 4. Session 4 ended with `insert_large_chunk()`
+found broken (silently dropped chunks on empty-bin and tail-insert paths),
+fix direction agreed but unapplied, and bin-climbing validated against real
+source but unwritten. **This session, the user applied the
+`insert_large_chunk()` fix themselves** (uploaded a new `my-malloc.c` with
+it already in place) — Claude's role this session was verification,
+measurement, and research, not writing the fix. No other code changes were
+applied to `my-malloc.c` this session.
 
 ---
 
-## Bug 10 (floor-vs-pad) — resolved this session
+## `insert_large_chunk()` fix — user-applied, verified correct
 
-**User's own diagnosis, stated directly**: the floor (absolute address
-anchored to `heap_start`, from Session 2) doesn't belong in this design.
-Reasoning: `top_chunk` already moves continuously as normal allocation
-carves from it, so pinning a shrink boundary to a *fixed* address
-(`heap_start + INITIAL_TOP_SIZE`) is a mismatch — real trim logic should
-be purely relative to wherever `top_chunk` currently sits.
+User's fix: explicit `list_is_empty(head)` branch for the empty-bin case
+(`list_add_after(head, ...)`, return), and for the non-empty case, a loop
+that walks `curr` forward while `next_block->payload >= chunk->payload`,
+breaking on the first strictly-smaller neighbor, followed by an
+**unconditional** `list_add_after(curr, &chunk->list)` after the loop —
+this is the key fix: every exit path from the function now reaches a real
+insertion, unlike the old version where falling out of the loop (empty
+bin, or chunk is the new smallest) skipped insertion entirely.
 
-**Verified against real source** (not just accepted on reasoning):
-searched glibc's `systrim()`. Its trim math —
-`top_area = top_size - MINSIZE - 1; extra = ALIGN_DOWN(top_area - pad, pagesize)`
-— references only the top chunk's own size and the `pad` parameter. No
-reference to the original/initial break anywhere. This confirms the
-Session 2 floor was an invented constraint, not something grounded in how
-real allocators trim.
+Verified empirically, directly against the user's uploaded file (not a
+hand-retyped copy):
 
-**User's fix** (already in the uploaded file): drop the floor clamp
-entirely, always shrink to `topchunkptr + HEADER_SIZE + TOP_PAD_SIZE`, and
-assign `payload = TOP_PAD_SIZE` directly instead of deriving it from an
-address subtraction.
+- `probe_sortbin3.c` (guard-block isolated, so frees can't coalesce into
+  neighbors or the top chunk): empty-bin insert → `list_length` goes to
+  `1`; a second, larger chunk inserted into a non-empty bin (the case that
+  used to silently vanish) → `list_length` goes to `2`. Both previously
+  broken paths now work.
+- `test_shrink_correctness.c` and `test_shrink_sbrk_fail.c` (from Session
+  4): still pass — no regressions from the fix.
 
-**This is not just "acceptable," it's algebraically identical to the old
-formula in the case where the floor clamp never fired.** Worked through
-the substitution live:
-
-```
-new_break (unclamped) = heap_end - topsize + SHRINK_KEEP
-payload_new            = new_break - top_chunk - HEADER_SIZE
-                        = (heap_end - top_chunk - HEADER_SIZE - topsize) + SHRINK_KEEP
-                        = 0 + SHRINK_KEEP                  (since topsize IS that difference)
-                        = SHRINK_KEEP  ==  TOP_PAD_SIZE
-```
-
-So the new code is a simplification that exploits this identity, not a
-behavior change in the common case — and removes the case-split (clamped
-vs. unclamped) entirely, which is the correct simplification once the
-floor's rationale doesn't hold. `check_top_chunk()`'s invariant
-(`(top+1) + topsize == heap_end`) still holds exactly under the new code.
-
-**Follow-up recommended, not yet applied**: add
-`static_assert(TOP_PAD_SIZE < SHRINK_THRESHOLD, ...)` in `my-malloc.h`.
-Previously this relationship held only because `SHRINK_KEEP = CHUNK_SIZE/4`
-and `SHRINK_THRESHOLD = CHUNK_SIZE*2` happened to satisfy it; the floor
-clamp used to be the thing implicitly protecting the subtraction
-`heap_end - topchunkptr_after_shrink` from underflow if that ever drifted.
-With the floor gone, nothing enforces it anymore — should be a
-compile-time assertion, not an assumption.
-
-**Status: bug 10 is now considered correctly resolved, verified via real
-source (glibc), not just code review.** No longer an open item.
+**Bug is resolved. No longer an open item.**
 
 ---
 
-## New bug found this session (not yet fixed): unchecked `sbrk()` return in shrink block
+## Bin ordering — confirmed descending, LRU tie-break (not the originally-intended ascending)
 
-While reviewing the new shrink block, found:
+Traced by hand and confirmed with `probe_order.c`: the fixed algorithm
+produces bins sorted **descending** by payload (largest chunk at head,
+smallest near tail) — the opposite of the old (broken) code's intent,
+which was ascending. Mechanism: `curr` starts at `head` (acts as a
+"virtual infinity"), advances past any neighbor that's still `>=` the new
+chunk, stops at the first strictly-smaller neighbor (or end of list), and
+inserts right after `curr`. Bigger new chunks lose the size comparison
+immediately at `head->next` and land at the head; smaller ones have to
+walk past everything bigger and land near the tail.
+
+Duplicate-size tie-breaking confirmed with `probe_dup.c`: because the
+loop condition is strict `<` (not `<=`), a new chunk equal in size to an
+existing one is walked *past* (not stopped at), so it always lands
+**after** the existing same-size chunk — new chunks of a given size end
+up further from the head than older ones of the same size. This matches
+dlmalloc's documented "ties go to the least recently used chunk"
+convention.
+
+This ordering is not a correctness requirement for the current code
+(`find_suitable_block()` doesn't rely on order — see below) but is a
+real, deliberate, now-understood invariant worth documenting in a comment
+near `insert_large_chunk()`, since the old inline comment ("insert before
+to keep sorted list") no longer describes what the code does.
+
+---
+
+## Search performance investigated — sort order exists but isn't exploited yet
+
+User asked directly: does the new order change how `find_suitable_block()`
+performs? Answered by measurement, not guesswork — instrumented a scratch
+copy (`my-malloc-instrumented.c`) using the **pre-existing but previously
+dead** `g_scan_steps` counter (declared in `my-malloc.h`, defined in
+`my-malloc.c`, never incremented anywhere in the real code before this).
+
+`probe_scan_cost.c` results, 6-element bin, non-exact-match requests (to
+avoid the O(1) head fast-path):
+
+| request | true best-fit location | scan steps |
+|---|---|---|
+| 2850 | 2912, at the **head** | 6 (full scan) |
+| 2450 | 2528, near the **tail** | 5 (near-full scan) |
+
+**Conclusion, stated carefully to avoid overclaiming**: the fix improved
+*correctness* (no more lost chunks) and produced a *valid, sortedness
+invariant* — but did **not** improve search *performance*. The scan cost
+is effectively O(n) regardless of where the answer sits, because
+`find_suitable_block()`'s `else` branch does a full `list_for_each_entry`
+with no early exit, exactly matching the pre-existing comment already in
+that function:
 
 ```c
-gm.topchunkptr->payload = TOP_PAD_SIZE;
-gm.topsize = gm.topchunkptr->payload;
-gm.heap_end = (char *)topchunkptr_after_shrink;
-sbrk(-(intptr_t)actual_shrink_amt);   // return value discarded
+// THIS IS STILL O(N) - can be optimize if use tree O(log n)
+...
+// TODO: CHANGE AFTER WE CHANGE TO SORTED BINS
 ```
 
-**Problem**: allocator state (`gm.topsize`, `gm.heap_end`, `payload`) is
-committed *before* confirming the kernel actually moved the break. If
-`sbrk()` fails (returns `(void*)-1`), the real break hasn't moved, but
-`gm.heap_end` now claims a lower address than reality — every future
-address computation derived from `gm.heap_end` is now silently wrong.
-Classic fail-silent bug, same fingerprint as bug 6 from Session 2 (state
-diverging from reality, symptom shows up several calls later in an
-unrelated place).
-
-**This is a real, still-open bug — not fixed in the uploaded file.**
-
-**Correct pattern discussed** (not yet written into the file): compute
-values into locals, call the fallible syscall, check its result, *only
-then* mutate `gm.*`. This is the same shape already used correctly in
-`grow_top()` (`sbrk()` first, check `== (void*)-1`, bail before touching
-`gm` on failure, commit only after success). The fix is to reorder the
-shrink block to match:
-
-```c
-if (sbrk(-(intptr_t)actual_shrink_amt) != (void *)-1)
-{
-    gm.topchunkptr->payload = TOP_PAD_SIZE;
-    gm.topsize = gm.topchunkptr->payload;
-    gm.heap_end = (char *)topchunkptr_after_shrink;
-}
-// else: sbrk failed, gm untouched — no rollback machinery needed,
-// because nothing was committed yet
-```
-
-General principle established for future review: "rollback" is the wrong
-mental model for `void*`-returning syscalls with no undo — the real
-pattern is **compute → confirm → commit**, only ever mutating shared
-state after the fallible call succeeds.
-
-**Status: identified and the fix is agreed, but not yet applied to
-`my-malloc.c`.** Next session should apply this reorder before anything
-else touches the shrink block.
+The sortedness now satisfies that TODO's precondition, but the early-exit
+change itself hasn't been written. **User confirmed they anticipated
+this while originally writing the scan loop and already left a comment
+marking the spot for a future early-exit swap** — consistent with (or
+possibly referring to) the TODO above.
 
 ---
 
-## Testing this bug — approach discussed, not yet written
+## Research: what real allocators do, and what it implies for build order
 
-Normal test runs can't reach the `sbrk` failure branch — `sbrk(negative)`
-essentially never fails on a single-threaded dev box. This needs **fault
-injection** via the linker, not a normal test.
+Searched glibc source/analyses specifically to answer "should we build
+the early-exit scan optimization or bin-climbing next?" Key finding,
+confirmed across multiple independent sources describing `malloc.c`:
+**"Binmap searches occur after an unsuccessful unsortedbin or largebin
+search."** I.e., in glibc, bin-climbing (via the binmap bitmap) is a
+fallback layer wrapped *around* the direct-bin search, not something that
+changes how the direct-bin search itself works.
 
-Planned approach (not yet implemented as a file):
+This directly implies bin-climbing and the early-exit scan optimization
+are **architecturally independent** in this codebase too: climbing only
+needs to decide *which bin index* gets fed into the existing
+scan-and-filter loop in `find_suitable_block()`'s `else` branch — the
+loop itself doesn't need to change for climbing to work.
 
-- Link with `-Wl,--wrap=sbrk`, which redirects unresolved calls to `sbrk`
-  inside the linked object files to a test-defined `__wrap_sbrk`, with
-  `__real_sbrk` available to call the genuine libc version.
-- `__wrap_sbrk` uses a test-controlled flag (e.g. `force_fail`) to return
-  `(void*)-1` on demand for negative increments only, forwarding
-  everything else (including the initial `heap_init()` growth) to
-  `__real_sbrk`.
-- Drive the allocator into the shrink branch normally, flip the fail flag
-  immediately before the triggering `free()`, then assert on
-  `debug_get_state()`'s fields to confirm `gm.heap_end` / `gm.topsize`
-  were **not** mutated when `sbrk` reports failure.
+**Recommendation given to the user (reasoned, not yet acted on)**:
+implement bin-climbing next, ahead of the early-exit optimization,
+because:
 
-Flagged pitfalls to remember when this gets written: calling `sbrk(...)`
-instead of `__real_sbrk(...)` inside `__wrap_sbrk` self-recurses into a
-stack overflow; the fail-flag approach isn't thread-safe (fine for now,
-not fine if concurrency tests reuse this harness); failing every `sbrk`
-call including the one inside `heap_init()` breaks test setup before the
-interesting case is even reached — the wrapper must be selective.
+1. The two features don't block each other (per the glibc structure
+   above), so order is a free choice — no reason not to pick the higher-
+   impact one first.
+2. Bin-climbing fixes a real **behavioral** bug still open since Session
+   3: an empty target bin currently makes `find_suitable_block()` return
+   `NULL` immediately even when a larger bin has a perfectly usable free
+   chunk, causing unnecessary `grow_top()`/`sbrk()` calls and heap bloat.
+   This is a resource-usage correctness issue, not just a speed one.
+3. The early-exit scan optimization doesn't fix any wrong behavior —
+   current results are always correct, just not maximally cheap to
+   compute. Lower priority by construction.
 
-**Status: no test file created yet.** User has not started writing it —
-correctly recognized as a fault-injection problem rather than a normal
-unit test before attempting it. This is the right next step to pick up.
-
----
-
----
-
-## New gap found this session (not yet fixed): `find_suitable_block()` không climb bin / does not climb to the next bin
-
-**VI**: User tự phát hiện — hiện tại `find_suitable_block(request_size)`
-chỉ nhìn đúng `gm.bins[idx]` với `idx = get_bin_bucket(request_size)`. Nếu
-bin đó rỗng, hàm `return NULL` ngay (dòng 80-84), dù một bin *lớn hơn* có
-thể đang có chunk free hoàn toàn dùng được. Kết quả: allocator carve từ
-top chunk / gọi `grow_top()` một cách không cần thiết, dù bộ nhớ free phù
-hợp đã tồn tại — gây phình heap (heap bloat) và tốn `sbrk()` oan.
-
-**EN**: `find_suitable_block()` only ever looks at the single exact bin
-`gm.bins[idx]`. If that bin is empty it gives up immediately (lines
-80-84) instead of checking whether a *larger* bin has a free block that
-would satisfy the request. This causes unnecessary top-chunk carving /
-`grow_top()` calls even when usable free memory exists elsewhere —
-classic segregated-fit gap, not a crash bug, a design/efficiency gap.
-
-**Grounded via real source (verified this session, not recited from
-memory)**: searched dlmalloc/ptmalloc's `malloc.c`. It solves this with a
-**binmap** — a bitmap tracking which bins are non-empty — so on a miss it
-jumps to the next non-empty bin in O(1) via `least_bit(leftbits)` /
-`idx2bit` bit-scan tricks, rather than scanning bin-by-bin. Relevant
-defines confirmed in source: `idx2bit`, `mark_bin`, `unmark_bin`,
-`get_binmap`, `BINMAPSHIFT`.
-
-**Quyết định phạm vi / scope decision**: dùng vòng lặp tuyến tính đơn
-giản (`for idx..NUM_BINS-1`, dừng ở bin non-empty đầu tiên) cho bước này,
-**không** làm bitmap ngay — file đã tự ghi chú
-`// THIS IS STILL O(N) - can be optimize if use tree O(log n)` ngay tại
-chỗ scan trong 1 bin, nên bitmap là tối ưu hoá cho *sau này*, không trộn
-vào cùng lúc với fix correctness/coverage này.
-
-**Vì sao climb lên là an toàn (correctness)**: theo cách `get_bin_bucket()`
-được thiết kế — small bin idx tăng đúng theo size (mỗi bậc 16 byte), large
-bin idx tăng theo dải luỹ thừa 2 — nên bin có idx **cao hơn** luôn chứa
-chunk `payload >= request_size`. Không cần lo chunk lấy được bị nhỏ hơn
-yêu cầu. Because of how `get_bin_bucket()` assigns bucket indices,
-any bin above `idx` is guaranteed to hold chunks large enough.
-
-**Không cần sửa gì thêm ở `my_malloc()`**: bước `split()` sau khi
-`find_suitable_block()` trả về đã tự cắt phần dư nếu đủ lớn
-(`payload >= request_size + MINBLOCKSIZE`), nên chunk lấy từ bin cao hơn
-tự động được xử lý đúng, không cần logic riêng.
-
-**Status: đã thống nhất hướng, chưa viết code.** User sẽ tự viết vòng lặp
-climb-bin sau (`for (int i = idx; i < NUM_BINS; i++) { ... }`, tái dùng
-logic scan-trong-1-bin đã có). Not implemented yet — next session or a
-later pass should pick this up alongside the other open items below.
+**Neither is implemented yet.** Session ended here (user reported being
+tired) with the decision made but no code written for either.
 
 ---
 
-## Current status (end of session 3)
+## Current status (end of session 5)
 
-- `/mnt/user-data/uploads/my-malloc.c`: `topchunkptr` rename applied
-  everywhere; floor-vs-pad redesign applied and verified correct
-  (algebraically and against real glibc behavior). **Not yet copied to
-  `/mnt/user-data/outputs/` as a corrected file** — no output file was
-  generated this session, only review/discussion.
-- New unfixed bug identified in the same shrink block (unchecked `sbrk`
-  return, commit-before-confirm ordering). Fix agreed but not applied.
-- `my-malloc.h` still needs the `TOP_PAD_SIZE < SHRINK_THRESHOLD`
-  static_assert added (carried over recommendation, not yet done).
-- No test file written this session for either the floor-vs-pad change or
-  the new sbrk-ordering bug.
+- `insert_large_chunk()`: **fixed and verified**, by the user, confirmed
+  by Claude against the actual uploaded file (not a retyped copy).
+- Bin ordering: confirmed descending with LRU-style tie-breaking;
+  documented above, not yet reflected in an updated code comment.
+- `find_suitable_block()`: confirmed via instrumentation to still be a
+  full O(n) scan regardless of bin order — matches its own pre-existing
+  TODO comment. Not yet changed.
+- Decision made: **bin-climbing before early-exit optimization**,
+  grounded in glibc's actual `malloc.c` structure. Neither implemented.
+- User has already marked the future early-exit swap spot with their own
+  comment while writing the scan loop — good forward-thinking, worth
+  preserving/consolidating with the existing TODO when that work starts.
+- Scratch probes from this session (`probe_sortbin3.c`, `probe_order.c`,
+  `probe_dup.c`, `probe_scan_cost.c`, `my-malloc-instrumented.c`) exist
+  only in the sandbox working directory — **not saved to outputs, not
+  promoted to real regression tests** (still print-only, no assertions).
+- `test_bugs.c` (user's own file, 3 issues from Session 4): still
+  untouched this session — `ensure_state`/`state` visibility, `#define
+  DEBUG` ordering, suspicious `#include "malloc.h"`, missing `fork()`
+  isolation.
 
 ## Open items / next steps
 
-1. **Apply the sbrk-ordering fix** to the shrink block in `my_free()` —
-   compute → confirm → commit, matching `grow_top()`'s existing pattern.
-2. Add `static_assert(TOP_PAD_SIZE < SHRINK_THRESHOLD, ...)` to
-   `my-malloc.h`.
-3. Write the `--wrap=sbrk` fault-injection test harness for the shrink
-   failure path (see approach above) — user's next actual task.
-4. Everything still open from Session 2, unchanged:
+1. **Implement bin-climbing** in `find_suitable_block()` — linear scan
+   `idx..NUM_BINS-1`, reuse the existing scan-and-filter loop verbatim
+   for whichever bin is landed on. Decided priority for next session.
+2. **Wire `g_scan_steps` into the real `find_suitable_block()`** (not
+   just a throwaway instrumented copy) so climbing's and the eventual
+   early-exit's before/after cost can be measured for real and tracked
+   over time.
+3. **Early-exit in the best-fit scan** — deferred until after
+   bin-climbing; spot already marked by the user's own comment plus the
+   pre-existing TODO in the code.
+4. **Promote this session's probes into real regression tests** —
+   `probe_sortbin3.c` / `probe_order.c` / `probe_dup.c` /
+   `probe_scan_cost.c` are all print-only right now; should gain
+   assertions (e.g. `assert(list_length(...) == expected)`,
+   `assert(g_scan_steps <= expected_bound)` once early-exit lands).
+5. **Fix `test_bugs.c`** (carried over from Session 4, still untouched):
+   reorder `#define DEBUG` before `#include "debug.h"` (or drop it in
+   favor of the `-DDEBUG` build flag); replace `ensure_state()`/`state`
+   with `debug_get_state()`; resolve the `#include "malloc.h"` line;
+   adopt the `fork()`-based test isolation pattern.
+6. Carried over from Session 2/3, still untouched:
    - Diagnose the non-deterministic crash (persistent mmap'd allocation +
      shrink combo) — `gdb` or `-fsanitize=undefined`, not printf
-     bisection. Still flagged as "before anything else touches
-     `my_free()`" — this session did touch `my_free()`'s shrink block
-     again, so this should move back to top priority next time.
-   - Stress-test `insert_large_chunk()`'s sorted-insert-in-the-middle
-     path (only the empty-bin fallback has been exercised so far).
-   - Decide a permanent home for scratch test files
-     (`test_sawtooth.c`, `test_sawtooth_debug2.c`, `test_floor.c`) —
-     likely `test/`.
-   - Test isolation strategy (`heap_reset_for_test()` vs.
-     one-process-per-test) still undecided.
-5. Once the sbrk-ordering fix and its test are both in, produce a
-   corrected `my-malloc.c` in `/mnt/user-data/outputs/` — none was
-   generated this session since no code changes were actually applied.
-6. Implement bin-climbing in `find_suitable_block()` (see section above)
-   — linear scan from `idx` to `NUM_BINS - 1`, first non-empty bin wins.
-   Correctness-safe by construction of `get_bin_bucket()`; no changes
-   needed elsewhere (`split()` already handles the leftover). User to
-   write it; discuss/review next time it comes up.
+     bisection.
+   - Decide a permanent home for scratch/test files (now includes this
+     session's probes too) — likely `test/`.
+7. Once bin-climbing and the early-exit optimization are both in and
+   tested, produce a corrected `my-malloc.c` in `/mnt/user-data/outputs/`
+   — none generated this session (verification/research only).

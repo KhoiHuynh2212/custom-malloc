@@ -538,20 +538,29 @@ void insert_large_chunk(mblockptr *chunk, size_t size)
 
     list *head = &gm.bins[idx];
 
-    list *pos = head->next;
-
-    while (pos != head)
-    {
-        mblockptr *pos_block = list_entry(pos, mblockptr, list);
-
-        // insert before to keep sorted list
-        if (chunk->payload < pos_block->payload)
-        {
-            list_add_before(pos, &chunk->list);
-            return;
-        }
-        pos = pos->next;
+    if(list_is_empty(head)) {
+        list_add_after(head, &chunk->list);
+        return;
     }
+
+    list *curr = head;
+
+   
+
+    while (curr->next != head)
+    {
+        mblockptr *next_block = list_entry(curr->next, mblockptr, list);
+        
+        // insert before to keep sorted list
+        if (next_block->payload < chunk->payload)
+        {
+            break;
+        }
+        curr = curr->next;
+    } 
+
+    list_add_after(curr, &chunk->list);
+
 }
 static_assert(TOP_PAD_SIZE < SHRINK_THRESHOLD, "shrink pad must be smaller than trigger threshold");
 

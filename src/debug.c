@@ -15,7 +15,7 @@ static void ensure_state(void)
 void check_top_chunk(void)
 {
     ensure_state();
-    assert((char *)(state->top_chunk + 1) + state->topsize == state->heap_end);
+    assert((char *)(state->topchunkptr + 1) + state->topsize == state->heap_end);
 }
 
 void check_bins(void)
@@ -32,7 +32,7 @@ void check_bins(void)
             assert(IS_FREE(curr));
             assert(get_bin_bucket(curr->payload) == i);
             assert(curr->payload == *footer);
-            assert(curr != state->top_chunk);
+            assert(curr != state->topchunkptr);
         }
     }
 }
@@ -42,7 +42,7 @@ void check_heap() {
     ensure_state();
     mblockptr * curr = (mblockptr *) state->heap_start;
 
-    while(curr != (mblockptr*) state->top_chunk && (char*) curr < state->heap_end)
+    while(curr != (mblockptr*) state->topchunkptr && (char*) curr < state->heap_end)
     {
         assert(curr->payload != 0);
         mblockptr* next = BLOCK_NEXT_HEADER(curr, curr->payload);
@@ -50,7 +50,7 @@ void check_heap() {
         size_t *footer = (size_t *)((char *)(curr + 1) + curr->payload);
         assert(curr->payload == *footer);
 
-        if(next != state->top_chunk) {
+        if(next != state->topchunkptr) {
             assert(!(IS_FREE(curr) && IS_FREE(next)));
         } else {
             assert(!IS_FREE(curr));
@@ -66,7 +66,7 @@ void check_heap_bin_consistency(void) {
     size_t free_chunk = 0;
     mblockptr * curr = (mblockptr*) state->heap_start;
 
-    while(curr != (mblockptr*) state->top_chunk && (char*) curr < state->heap_end) {
+    while(curr != (mblockptr*) state->topchunkptr && (char*) curr < state->heap_end) {
         if(IS_FREE(curr)) {
             free_chunk++;
         }
