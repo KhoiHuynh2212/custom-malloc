@@ -63,6 +63,47 @@ void test_shrink_lands_on_pad_size(void) {
            st->topsize, SHRINK_THRESHOLD);
 
 }
+
+
+void test_descending_order_bin(void) {
+    heap_init();
+
+    const malloc_state *st = debug_get_state();
+
+    void* p = my_malloc(2208);
+    void* sp1 = my_malloc(64);
+    void* a = my_malloc(3001);
+    void* sp2 = my_malloc(64);
+    void* b = my_malloc(3234);
+    void* sp3 = my_malloc(64);
+
+   
+    int idx1 = get_bin_bucket(2208);
+    int idx2 = get_bin_bucket(2103);
+    int idx3 = get_bin_bucket(2304);
+
+    printf("Index 1 is %d\n", idx1);
+    printf("Index 2 is %d\n", idx2);
+    printf("Index 3 is %d\n", idx3);
+
+    my_free(p);
+    my_free(a);
+    my_free(b);
+
+    check_heap_bin_consistency();
+    
+
+    const list* head = &st->bins[idx1];\
+    assert(list_length(head) == 3);
+    list* curr = head->next;
+    do {
+        mblockptr * curr_block = list_entry(curr, mblockptr, list);
+        size_t size = curr_block->payload;
+        list* next = curr->next;
+        printf("Value is %d\n", (int)size);
+        curr = curr->next;
+    } while(curr != head);
+}
 int main() {
-    test_shrink_lands_on_pad_size();
+    test_descending_order_bin();
 }

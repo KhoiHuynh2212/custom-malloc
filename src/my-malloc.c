@@ -78,9 +78,18 @@ mblockptr *find_suitable_block(size_t request_size)
     int idx = get_bin_bucket(request_size);
 
     if (list_is_empty(&gm.bins[idx]))
-    {
-        // if the bins are empty, we carve from the top chunk
-        return NULL;
+    {   
+        bool found = false;
+        for(int i = idx; i < NUM_BINS - 1;i++) {
+            if(!list_is_empty(&gm.bins[i])) {
+                found = true;
+                idx = i;
+                break;
+            } 
+        }
+        if(!found) {
+            return NULL;
+        }
     }
 
     list *curr = &gm.bins[idx]; // curr is head of that bins
@@ -101,14 +110,14 @@ mblockptr *find_suitable_block(size_t request_size)
         mblockptr *best = NULL;
         list_for_each_entry(curr_block, &gm.bins[idx], list)
         {
+            g_scan_steps++;
 
-            if (curr_block->payload < request_size)
-                continue;
-
-            if (best == NULL || curr_block->payload < best->payload)
-            {
+            if (curr_block->payload >= request_size) {
                 best = curr_block;
+            } else {
+                break;
             }
+                
         }
 
         if (best != NULL)
