@@ -1,5 +1,7 @@
 #include "debug.h"
 #include "my-malloc.h"
+#include <stdlib.h>
+#include <time.h>
 
 void test_grow_top_topsize_stays_synced(void)
 {
@@ -173,7 +175,43 @@ void test_descending_order_bin(void)
     my_free(sp6);
     my_free(sp7);
 }
+
+#define N 1000
+#define BIG_SIZE 136 * 1024 // adjust so it exceeds your mmap threshold
+#define SMALL_MIN 16
+#define SMALL_MAX 512
+
+void test_non_deterministic_crash(void)
+{
+    heap_init();
+    srand(time(NULL));
+
+    
+    void *ptrs[N];
+    memset(ptrs, 0, sizeof(ptrs));
+
+    for (int i = 0; i < N; i++) {
+        size_t sz = (i % 10 == 0) ? BIG_SIZE : (SMALL_MIN + rand() % SMALL_MAX);
+        ptrs[i] = my_malloc(sz);
+
+        if (i > 5 && rand() % 3 == 0)
+        {
+            int victim = rand() % i;
+            if (ptrs[victim] != NULL)
+            {
+                my_free(ptrs[victim]);
+                ptrs[victim] = NULL;
+            }
+        }
+    }
+
+    for (int i = 0; i < N; i++) {
+        if (ptrs[i] != NULL)
+            my_free(ptrs[i]);
+    }
+}
+
 int main()
 {
-    test_descending_order_bin();
+    test_non_deterministic_crash();
 }

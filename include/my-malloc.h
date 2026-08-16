@@ -109,9 +109,5 @@ void *my_realloc(void *ptr, size_t size);
 void *my_calloc(size_t num, size_t size);
 void my_free(void *ptr); 
 
-#ifdef DEBUG
-const malloc_state *debug_get_state(void);
-#endif
-
 #endif // MY_MALLOC_H 
 

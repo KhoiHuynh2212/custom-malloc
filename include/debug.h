@@ -1,6 +1,7 @@
 #include "my-malloc.h"
 
 #ifdef DEBUG
+const malloc_state *debug_get_state(void);
 
 void check_heap(void);
 void check_bins(void);

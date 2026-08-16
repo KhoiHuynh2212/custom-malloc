@@ -292,6 +292,14 @@ void *my_malloc(size_t size)
 
             mblockptr *p = gm.topchunkptr; // start at old top
             size_t needed = request_size + ALIGN_HEADER_FOOTER;
+            if(needed > gm.topsize) {
+                // grow if the top chunk is too small
+                if (grow_top(request_size) == NULL)
+                {
+                    pthread_mutex_unlock(&global_lock);
+                    return NULL;
+                }
+            }
             p->payload = request_size;
             SET_ALLOCATED(p);
             set_footer(p);
