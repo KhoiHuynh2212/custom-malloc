@@ -159,15 +159,17 @@ mblockptr *split(mblockptr *block, size_t request_size)
     mblockptr *remainder = BLOCK_NEXT_HEADER(block, request_size);
     remainder->payload = block->payload - REQUEST_CHUNK(request_size);
     remainder->flags = 0;
-    SET_FREE(remainder); // set it as free;
+    SET_FREE(remainder);
     set_footer(remainder);
     list_init(&remainder->list);
 
-    list_add_after(&gm.bins[get_bin_bucket(remainder->payload)], &remainder->list);
+    if (remainder->payload < SMALL_BIN_MAX)
+        insert_small_chunk(remainder, remainder->payload);
+    else
+        insert_large_chunk(remainder, remainder->payload);
 
-    // block get trimmed and given to the caller
     block->payload = request_size;
-    SET_ALLOCATED(block); // set it allocated
+    SET_ALLOCATED(block);
     set_footer(block);
     list_unlink(&block->list);
 
@@ -293,7 +295,7 @@ void *my_malloc(size_t size)
             mblockptr *p = gm.topchunkptr; // start at old top
             size_t needed = request_size + ALIGN_HEADER_FOOTER;
             if(needed > gm.topsize) {
-                // grow if the top chunk is too small
+                // grow if the top chunk is smaller than needed
                 if (grow_top(request_size) == NULL)
                 {
                     pthread_mutex_unlock(&global_lock);
@@ -306,7 +308,6 @@ void *my_malloc(size_t size)
 
             gm.topsize -= needed;
             gm.topchunkptr = BLOCK_NEXT_HEADER(p, request_size); // bump request byte
-
             gm.topchunkptr->payload = gm.topsize;
             gm.topchunkptr->flags = 0;
             SET_FREE(gm.topchunkptr);
@@ -342,7 +343,7 @@ void *my_calloc(size_t num, size_t size)
     if (num != 0 && size > __SIZE_MAX__ / num)
     {
         return NULL;
-    }
+    }       
 
     void *ptr = my_malloc(num * size);
     if (ptr == NULL)
@@ -358,7 +359,6 @@ void *my_calloc(size_t num, size_t size)
 mblockptr *try_expand(mblockptr *curr, size_t new_payload)
 {
 
-    // TODO : gm.topchunk case
     mblockptr *next = BLOCK_NEXT_HEADER(curr, curr->payload);
 
     if (next == gm.topchunkptr)
@@ -443,13 +443,14 @@ void *my_realloc(void *ptr, size_t size)
     mblockptr *current_block = (mblockptr *)ptr - 1;
 
     if (!IS_MMAP(current_block))
-    {
+    {   
+        // SBRK BRANCH
         int s = pthread_mutex_lock(&global_lock);
         if (s != 0)
             fprintf(stderr, "pthread_mutex_lock failed\n");
 
         // resize to smaller size, cut off and split the block
-        if (request_size <= current_block->payload)
+        if (current_block->payload >= request_size)
         {
             if (current_block->payload >= request_size + MINBLOCKSIZE)
                 split(current_block, request_size);
@@ -474,56 +475,30 @@ void *my_realloc(void *ptr, size_t size)
             }
         }
 
-        mblockptr *next_block = BLOCK_NEXT_HEADER(current_block, current_block->payload);
-
-        if ((char *)next_block == gm.heap_end)
-        {
-
-            size_t buffered = current_block->payload + current_block->payload;
-            size_t new_payload = (buffered > request_size) ? buffered : request_size;
-            size_t allocated_size = new_payload - current_block->payload;
-
-            if (request_size < MMAP_THRESHOLD)
-            {
-                // automatically extend the program break and update its heap and payload
-                void *request = sbrk(allocated_size);
-                if (request != (void *)-1)
-                {
-                    current_block->payload += allocated_size;
-                    set_footer(current_block);
-                    gm.heap_end += allocated_size;
-
-                    if (current_block->payload >= request_size + MINBLOCKSIZE)
-                        split(current_block, request_size);
-
-                    pthread_mutex_unlock(&global_lock);
-                    return ptr;
-                }
-            }
-        }
-        pthread_mutex_unlock(&global_lock);
     }
     else
     {
-
+        // MMAP BRANCH
         if (request_size <= current_block->payload)
         {
             return ptr;
         }
 
         void *new_loc;
-        new_loc = mremap(current_block, current_block->payload + ALIGN_HEADER_FOOTER, request_size + ALIGN_HEADER_FOOTER, MREMAP_MAYMOVE);
-        if (new_loc == MAP_FAILED)
+        size_t total_need = ALIGN_HEADER_FOOTER + request_size;
+        size_t total_page_up = ((total_need + LINUX_PAGE - 1) & ~(LINUX_PAGE - 1));
+        new_loc = mremap(current_block, current_block->payload + ALIGN_HEADER_FOOTER, total_page_up, MREMAP_MAYMOVE);
+        if (new_loc != MAP_FAILED)
         {
+            mblockptr *nb = (mblockptr *)new_loc;
+            nb->payload = total_page_up - HEADER_SIZE - FOOTER_SIZE;
+            set_footer(nb);
+            return nb + 1;
+        } else {
+           /* mremap failed: current_block (old payload) remains untouched —
+                intentionally fall through to the common malloc-copy-free path at the end instead of returning NULL */
             perror("mremap");
-            return NULL;
         }
-
-        mblockptr *nb = (mblockptr *)new_loc;
-        nb->payload = request_size;
-        set_footer(nb);
-
-        return nb + 1;
     }
 
     new_ptr = my_malloc(size);

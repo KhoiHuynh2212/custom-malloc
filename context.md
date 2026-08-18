@@ -1,92 +1,69 @@
-# Custom Allocator (`my-malloc`) — Session 7 Context
+# Context: my-malloc — realloc & mmap branch
 
-Continues directly from Session 6. Session 6 ended with `find_suitable_block()`
-fully done (bin-climbing + early-exit, both verified and measured), two new
-regression tests passing, and the non-deterministic mmap/shrink crash (open
-item since Session 2/3) still undiagnosed with no test written. **This session
-found, fixed, and regression-tested that crash.**
+Tóm tắt phiên làm việc, dùng để tiếp tục ở session sau.
 
----
+## Đã sửa xong
 
-## Non-deterministic crash — diagnosed, fixed, and regression-tested
+1. **Nhánh mmap trong `my_realloc` — invariant `payload` sai sau `mremap`**
+   - Bug: `nb->payload = request_size;` (không làm tròn page) → phá vỡ bất biến
+     "payload luôn khớp kích thước mmap thật đã page-round", gây lệch `old_size`
+     ở lần `mremap`/`munmap` tiếp theo.
+   - Fix: tính `total_page_up` (làm tròn theo `LINUX_PAGE`) và gán
+     `nb->payload = total_page_up - HEADER_SIZE - FOOTER_SIZE;` — giống hệt
+     công thức đã dùng trong `my_malloc`.
 
-**Root cause found:** in `my_malloc()`'s top-chunk bump path (`my-malloc.c`,
-around line 299-304), `gm.topchunkptr` was bumped forward and written to
-(`gm.topchunkptr->payload = ...`) without first checking whether the new
-position would land past `gm.heap_end`. Under enough random alloc/free
-pressure, `gm.topsize` could go too small to satisfy a request without the
-existing checks catching it, so the bump walked `topchunkptr` off the end of
-mapped memory — the write there is what ASan caught as a SEGV.
+2. **Nhánh mmap khi `mremap` fail — thiếu fallback**
+   - Bug cũ: `return NULL;` ngay khi fail, không thử `malloc-copy-free` như
+     glibc thật làm (đã grounded qua `_int_realloc`).
+   - Fix: không `return`, để rơi tự nhiên xuống đoạn `malloc-copy-free` chung
+     cuối hàm `my_realloc`. Đã dọn sạch một đoạn `if` chết (dead code) từng
+     xuất hiện khi sửa nửa vời.
 
-- **Test written**: `test_non_deterministic_crash()` in `test_bugs.c`.
-  Loops 1000 allocations per run (mix of a large mmap-triggering size every
-  10th iteration, plus random small sizes via `rand()`), with random frees
-  mixed in (not LIFO) to exercise coalesce/shrink paths. Runs 20 times with
-  varied seeds (`time(NULL) + run`) since the bug is non-deterministic and a
-  single seed isn't reliable enough to catch it.
-- User found the bug themselves by reading the ASan trace (`SEGV ... WRITE
-  memory access ... my-malloc.c:302`) and correctly reasoning from the
-  surrounding code (`topsize -=`, `topchunkptr = BLOCK_NEXT_HEADER(...)`,
-  then writes to the new `topchunkptr`) that no bounds check against
-  `heap_end` existed before the write.
-- Fix applied by user directly in their environment; confirmed via 15
-  consecutive clean runs of `make bug` after the fix (previously crashed
-  reliably).
-- **Invariant now asserted in the test**, not just "didn't crash": added
-  `assert((uint8_t *)gm.topchunkptr <= (uint8_t *)gm.heap_end)` inside the
-  allocation loop, so future regressions fail loudly with a line number
-  instead of relying on ASan/SEGV to notice.
+3. **`insert_large_chunk` cần sorted-descending** (đổi thiết kế bin sang best-fit)
+   → `split()` đang chèn remainder bằng `list_add_after` thô, phá vỡ sort
+   invariant. **Fix đề xuất**: thay bằng gọi `insert_small_chunk`/
+   `insert_large_chunk` tùy theo size, giống cách `my_free` đang làm.
+   *(Chưa xác nhận đã áp dụng vào file thật hay chưa — cần kiểm tra lại.)*
 
-**This closes Session 2/3's open item #3 (non-deterministic mmap/shrink
-crash).**
+4. **Nhánh sbrk-thẳng trong `my_realloc` (`if (next_block == gm.heap_end)`)**
+   - Bug: điều kiện gần như không bao giờ đúng, vì luôn tồn tại header của
+     top chunk xen giữa block cuối và `heap_end` (theo đúng invariant
+     `check_top_chunk`). Nếu chạy được, code tự `sbrk()` tay và không cập
+     nhật `gm.topchunkptr`/`gm.topsize` → phá invariant ngay.
+   - Fix: **xóa hẳn khối này**. Case nó nhắm tới (current_block kề top
+     chunk) đã được `try_expand()` xử lý đúng (nhánh `next == gm.topchunkptr`).
 
-## Flagged for follow-up: possible second instance of same bug pattern
+## Đang mở / chưa làm
 
-During the audit (`grep -n "topchunkptr" src/my-malloc.c`), a structurally
-similar top-chunk bump appears again in the realloc path around
-`my-malloc.c:368-376` (`gm.topsize -= needed; gm.topchunkptr = np;
-gm.topchunkptr->payload = gm.topsize; ...`) — **not yet confirmed whether
-this spot has the same missing-bounds-check gap**, since it wasn't the one
-that crashed this session. Worth a targeted check before considering the
-top-chunk-bump pattern fully audited.
+- **`try_expand` giữ nguyên vị trí gọi hiện tại** trong `my_realloc` (không
+  cần di chuyển) — chỉ cần xóa khối dead code ở trên.
+- **Guard `request_size < MMAP_THRESHOLD`** trước `try_expand` và sbrk-extend:
+  **giữ nguyên, không phải dư thừa.** Lý do: thiết kế hiện tại buộc bất biến
+  "size lớn ⇒ phải là mmap chunk" vì logic shrink-to-OS trong `my_free` chỉ
+  xử lý top chunk, chưa có cơ chế trim chunk giữa heap. Nếu bỏ guard mà chưa
+  có cơ chế trim tổng quát, sẽ tạo ra chunk to không có `MMAP_BIT` kẹt vĩnh
+  viễn trong bin, không bao giờ trả được cho OS.
 
----
+- **Thiết kế "trim tốt hơn" cho chunk giữa heap** (chủ đề đang dang dở):
+  - Sự thật nền tảng: `sbrk`/`brk` **chỉ di chuyển được một điểm ở cuối heap**
+    — không thể trả bộ nhớ cho một chunk nằm giữa heap bằng sbrk, bất kể to
+    cỡ nào.
+  - Hướng đúng (giống glibc/nhiều allocator khác): dùng
+    `madvise(addr, len, MADV_DONTNEED)` lên các trang vật lý *bên trong*
+    payload của free chunk — **không đổi gì về mặt logic** (chunk vẫn nằm
+    nguyên trong bin, size không đổi), chỉ nhả RAM vật lý; chạm lại sau này
+    kernel tự cấp trang mới.
+  - Bẫy quan trọng: phải **round-in** địa chỉ (`ceil` cho start, `floor` cho
+    end) theo page, tuyệt đối không round-out — nếu không sẽ vô tình
+    `MADV_DONTNEED` đè lên header/footer của chính chunk hoặc chunk kế bên,
+    gây corruption khi kernel zero-fill lại trang đó.
+  - Câu hỏi chưa chốt: gọi trim ngay trong `my_free` mỗi lần chunk đủ to được
+    free (đơn giản, tốn syscall mỗi lần), hay quét định kỳ theo ngưỡng tổng
+    free memory (giống `malloc_trim`, cần thêm state theo dõi)?
 
-## Current status (end of session 7)
+## Việc tiếp theo gợi ý
 
-- Non-deterministic mmap/shrink crash: **diagnosed and fixed**. Root cause
-  was an unchecked `topchunkptr` bump past `heap_end` in `my_malloc()`'s
-  top-chunk path (~line 299-304).
-- New regression test `test_non_deterministic_crash()` in `test_bugs.c`:
-  1000-alloc randomized loop × 20 seeded runs, with an `assert()` on the
-  `topchunkptr <= heap_end` invariant. Passing after the fix (was reliably
-  crashing before).
-- Realloc path (~line 368-376) has a similar-looking top-chunk bump —
-  flagged, not yet audited for the same bug.
-- No other changes made this session; `find_suitable_block()` work from
-  Session 6 untouched and still verified working.
-
-## Open items / next steps
-
-1. **Audit realloc's top-chunk bump (~line 368-376)** for the same
-   missing-bounds-check pattern found in `my_malloc()` this session.
-2. **`ensure_state()`/`state` visibility fix in `debug.c`** — carried over
-   from Session 4, still untouched. Also carried: whether `state` should be
-   exposed differently, and the `fork()`-based test isolation pattern
-   mentioned in Session 5 notes.
-3. **`test_bugs.c` cleanup** — 1 of 3 known issues fixed (Session 6:
-   `malloc.h` → `my-malloc.h`). Remaining:
-   - `ensure_state()`/`state` visibility in `debug.c` (see #2 above).
-   - One harmless leftover warning (redefined `DEBUG`) needs a one-line fix.
-4. **Session 5's general probes** (`probe_sortbin3.c`, `probe_order.c`,
-   `probe_dup.c`, `probe_scan_cost.c`, `my-malloc-instrumented.c`) still
-   exist only in sandbox scratch space, not ported/deleted — superseded in
-   spirit by Session 6's two tests plus this session's crash test, but not
-   formally cleaned up.
-5. **Decide a permanent home for scratch/test files** — carried over,
-   still open (likely `test/`, per Session 5 notes).
-6. Once the realloc audit (#1) and remaining `test_bugs.c`/`debug.c` items
-   (#2, #3) are resolved, produce a corrected `my-malloc.c` + `test_bugs.c`
-   pair in `/mnt/user-data/outputs/` — none generated this session (fix and
-   test were written directly by the user in their own environment via
-   `gcc`/`make`, not authored/output by Claude).
+1. Xác nhận lại `split()` đã áp dụng fix insert-sorted hay chưa (mục 3).
+2. Xóa khối dead code sbrk-extend (mục 4) trong file thật.
+3. Quyết định thời điểm gọi trim (câu hỏi cuối cùng ở trên) rồi bắt tay viết
+   `madvise`-based trim cho free chunk giữa heap.
