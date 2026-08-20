@@ -516,6 +516,33 @@ void *my_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
+size_t trim_chunk(mblockptr* block) {
+
+    if(!IS_FREE(block) || IS_MMAP(block)) {
+        return 0;
+    }
+
+    char* payload_start = (char*) (block + 1); 
+    char* payload_end = payload_start + block->payload;
+
+    size_t page = (size_t)LINUX_PAGE;
+
+    uintptr_t start = ((uintptr_t) payload_start + page - 1) & ~(page - 1); // ROUND UP
+    uintptr_t end = (uintptr_t) payload_end & ~(page - 1); // ROUND DOWN
+
+    if(start >= end) {
+        return 0;
+    } 
+
+    if(madvise((void*) start, end - start, MADV_DONTNEED) != 0) {
+        return 0;
+    }
+
+    return end - start;
+} 
+
+
+
 void insert_small_chunk(mblockptr *chunk, size_t size)
 {
     int idx = get_bin_bucket(size);
@@ -536,8 +563,6 @@ void insert_large_chunk(mblockptr *chunk, size_t size)
     }
 
     list *curr = head;
-
-   
 
     while (curr->next != head)
     {

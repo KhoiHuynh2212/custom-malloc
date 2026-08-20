@@ -213,5 +213,11 @@ void test_non_deterministic_crash(void)
 
 int main()
 {
-    test_non_deterministic_crash();
+    test_non_deterministic_crash(); 
+
+    int idx = get_bin_bucket(4096);
+
+    printf("Idx is %d\n", idx);
+
+    return 0;
 }
