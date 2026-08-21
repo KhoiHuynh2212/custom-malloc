@@ -1,4 +1,5 @@
-#include "my-malloc.h"
+#include "../include/my-malloc.h"
+#include "internal.h"
 
 static malloc_state gm; // allocator state
 
@@ -387,8 +388,6 @@ mblockptr *try_expand(mblockptr *curr, size_t new_payload)
 
     int next_free = ((char *)next < gm.heap_end && IS_FREE(next));
 
-    size_t next_gains = next_free ? (next->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
-
     if (next_free)
     {
         list_unlink(&next->list);
@@ -405,8 +404,6 @@ mblockptr *try_expand(mblockptr *curr, size_t new_payload)
     mblockptr *prev = prev_free ? BLOCK_PREV_HEADER(curr, *footer) : NULL;
 
     prev_free = (prev_free && (char *)prev >= gm.heap_start && IS_FREE(prev));
-
-    size_t prev_gains = prev_free ? (prev->payload + HEADER_SIZE + FOOTER_SIZE) : 0;
 
     if (prev_free && (curr->payload + prev->payload + HEADER_SIZE + FOOTER_SIZE >= new_payload))
     {
@@ -516,7 +513,7 @@ void *my_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
-static size_t trim_chunk(mblockptr* block) {
+size_t trim_chunk(mblockptr* block) {
 
     if(!IS_FREE(block) || IS_MMAP(block)) {
         return 0;
@@ -541,13 +538,13 @@ static size_t trim_chunk(mblockptr* block) {
     return end - start;
 } 
 
-size_t malloc_trim(void){
+size_t my_malloc_trim(void){
 
     const size_t ps = LINUX_PAGE; 
 
     int psindex = get_bin(ps);
 
-    const size_t psm1 = ps - 1; 
+    // const size_t psm1 = ps - 1; 
 
     size_t total_trimmed = 0;
 
@@ -570,14 +567,14 @@ size_t malloc_trim(void){
     return total_trimmed;    
 }
 
-static void insert_small_chunk(mblockptr *chunk, size_t size)
+void insert_small_chunk(mblockptr *chunk, size_t size)
 {
     int idx = get_bin(size);
     list *head = &gm.bins[idx]; // now at the sentinel head
     list_push_front(head, &chunk->list);
 }
 
-static void insert_large_chunk(mblockptr *chunk, size_t size)
+void insert_large_chunk(mblockptr *chunk, size_t size)
 {
 
     int idx = get_bin(size);

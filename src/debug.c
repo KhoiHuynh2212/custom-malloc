@@ -1,5 +1,4 @@
 #include <assert.h>
-#include "my-malloc.h"
 #include "debug.h"
 
 #ifdef DEBUG
@@ -30,7 +29,7 @@ void check_bins(void)
             assert(curr->payload != 0);
             size_t *footer = (size_t *)((char *)(curr + 1) + curr->payload);
             assert(IS_FREE(curr));
-            assert(get_bin_bucket(curr->payload) == i);
+            assert(get_bin(curr->payload) == i);
             assert(curr->payload == *footer);
             assert(curr != state->topchunkptr);
         }
@@ -38,7 +37,7 @@ void check_bins(void)
 }
 
 
-void check_heap() {
+void check_heap(void) {
     ensure_state();
     mblockptr * curr = (mblockptr *) state->heap_start;
 

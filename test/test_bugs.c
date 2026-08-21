@@ -1,4 +1,4 @@
-#include "debug.h"
+#include "../src/debug.h"
 #include "my-malloc.h"
 #include <stdlib.h>
 #include <time.h>
@@ -15,6 +15,9 @@ void test_grow_top_topsize_stays_synced(void)
     check_top_chunk();
 
     printf("test_grow_top_topsize_stays_synced: PASS\n");
+
+    my_free(a);
+    my_free(b);
 }
 
 void test_top_carve_payload_matches_request(void)
@@ -23,6 +26,8 @@ void test_top_carve_payload_matches_request(void)
     void *p = my_malloc(200);
     check_heap();
     printf("test_top_carve_payload_matches_request: PASS\n");
+
+    my_free(p);
 }
 
 void test_no_shrink_below_threshold(void)
@@ -38,7 +43,7 @@ void test_no_shrink_below_threshold(void)
     assert(s->heap_end == heap_end_before);
     assert(s->topsize != TOP_PAD_SIZE);
     assert(s->topsize >= top_size_before);
-    printf("test_no_shrink_below_threshold: PASS (topsize=%zu, still below %d)\n",
+    printf("test_no_shrink_below_threshold: PASS (topsize=%zu, still below %ld)\n",
            s->topsize, SHRINK_THRESHOLD);
 }
 
@@ -59,7 +64,7 @@ void test_shrink_lands_on_pad_size(void)
     assert(st->topchunkptr->payload == (size_t)TOP_PAD_SIZE);
     assert((char *)(st->topchunkptr + 1) + st->topsize == st->heap_end);
 
-    printf("test_no_shrink_below_threshold: PASS (topsize=%zu, still below %d)\n",
+    printf("test_no_shrink_below_threshold: PASS (topsize=%zu, still below %ld)\n",
            st->topsize, SHRINK_THRESHOLD);
 }
 
