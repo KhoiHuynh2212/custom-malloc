@@ -56,7 +56,7 @@ void heap_init()
     pthread_mutex_unlock(&global_lock);
 }
 
-int get_bin_bucket(size_t payload)
+int get_bin(size_t payload)
 {
     if (payload < SMALL_BIN_MAX)
     {
@@ -75,7 +75,7 @@ int get_bin_bucket(size_t payload)
 
 mblockptr *find_suitable_block(size_t request_size)
 {
-    int idx = get_bin_bucket(request_size);
+    int idx = get_bin(request_size);
 
     if (list_is_empty(&gm.bins[idx]))
     {   
@@ -516,7 +516,7 @@ void *my_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
-size_t trim_chunk(mblockptr* block) {
+static size_t trim_chunk(mblockptr* block) {
 
     if(!IS_FREE(block) || IS_MMAP(block)) {
         return 0;
@@ -541,19 +541,46 @@ size_t trim_chunk(mblockptr* block) {
     return end - start;
 } 
 
+size_t malloc_trim(void){
 
+    const size_t ps = LINUX_PAGE; 
 
-void insert_small_chunk(mblockptr *chunk, size_t size)
+    int psindex = get_bin(ps);
+
+    const size_t psm1 = ps - 1; 
+
+    size_t total_trimmed = 0;
+
+    int s = pthread_mutex_lock(&global_lock);
+    if (s != 0)
+        fprintf(stderr, "pthread_mutex_lock failed\n");
+
+    mblockptr* curr;
+    for(int i = 0; i < NUM_BINS; ++i) {
+        if(i >= psindex) {
+            list_for_each_entry(curr, &gm.bins[i], list) {
+                total_trimmed += trim_chunk(curr);
+            }
+        }
+    } 
+
+    s = pthread_mutex_unlock(&global_lock);
+    if (s != 0)
+        fprintf(stderr, "pthread_mutex_unlock failed\n");
+    return total_trimmed;    
+}
+
+static void insert_small_chunk(mblockptr *chunk, size_t size)
 {
-    int idx = get_bin_bucket(size);
+    int idx = get_bin(size);
     list *head = &gm.bins[idx]; // now at the sentinel head
     list_push_front(head, &chunk->list);
 }
 
-void insert_large_chunk(mblockptr *chunk, size_t size)
+static void insert_large_chunk(mblockptr *chunk, size_t size)
 {
 
-    int idx = get_bin_bucket(size);
+    int idx = get_bin(size);
 
     list *head = &gm.bins[idx];
 

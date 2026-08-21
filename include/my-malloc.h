@@ -88,10 +88,9 @@ mblockptr *split(mblockptr *block, size_t request_payload);
 mblockptr *coalesce(mblockptr *curr);
 mblockptr *try_expand(mblockptr *curr, size_t new_payload);
 
-int get_bin_bucket(size_t payload);
+int get_bin(size_t payload);
 size_t get_MSB_bit(size_t x);
 
-size_t trim_chunk(mblockptr* ptr);
 size_t malloc_trim(void);
 
 static inline void set_footer(mblockptr *block)

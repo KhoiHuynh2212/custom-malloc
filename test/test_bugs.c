@@ -99,8 +99,8 @@ void test_descending_order_bin(void)
 
     long g_scan_before = g_scan_steps;
     printf("Scan before is %ld\n", g_scan_before);
-    int idx1 = get_bin_bucket(2208);
-    assert(idx1 == get_bin_bucket(2208));
+    int idx1 = get_bin(2208);
+    assert(idx1 == get_bin(2208));
 
     my_free(p);
     my_free(a);
@@ -153,7 +153,7 @@ void test_descending_order_bin(void)
     void *sp7 = my_malloc(64);
     assert(sp7 != NULL);
 
-    int idx2 = get_bin_bucket(2560);
+    int idx2 = get_bin(2560);
 
     my_free(dup1);
     my_free(dup2);
@@ -215,7 +215,7 @@ int main()
 {
     test_non_deterministic_crash(); 
 
-    int idx = get_bin_bucket(4096);
+    int idx = get_bin(4096);
 
     printf("Idx is %d\n", idx);
 
