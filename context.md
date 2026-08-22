@@ -1,138 +1,147 @@
-# Context: my-malloc — trim giữa heap & refactor kiến trúc
+# Context: my-malloc — refactor xong, đang lên kế hoạch viết test
 
-Tóm tắt phiên làm việc, dùng để tiếp tục ở session sau. Vai trò AI: mentor
-senior systems engineer, dạy theo 5-step (big picture -> diagram -> code
-tối thiểu -> pitfall -> câu hỏi kiểm tra), luôn grounded qua source thật
-(đã curl trực tiếp glibc `malloc.c`, `sysconf.c`, `getpagesize.c`, và
-`dlmalloc.c`) thay vì suy đoán từ trí nhớ.
+Tóm tắt phiên làm việc (tiếp theo phiên trước). Vai trò AI: mentor senior
+systems engineer, dạy theo 5-step (big picture -> diagram -> code tối
+thiểu -> pitfall -> câu hỏi kiểm tra), grounded qua source thật, không
+đoán từ trí nhớ khi chưa verify.
 
-## Đã học / đã xác nhận (grounded qua source thật)
+## Trạng thái refactor kiến trúc — ĐÃ ÁP DỤNG (khác với phiên trước, lúc đó
+mới chỉ bàn, chưa làm)
 
-1. **glibc's `mtrim()`** (trong `malloc.c`) là bản đầy đủ, madvise từng
-   chunk giữa heap; **KHÔNG** được `free()` tự động gọi — chỉ `systrim`
-   (top-only, qua sbrk âm) mới tự động, khi size vừa free
-   `>= FASTBIN_CONSOLIDATION_THRESHOLD` VÀ topchunk
-   `>= M_TRIM_THRESHOLD`. `mtrim()` đầy đủ chỉ chạy khi app tự gọi
-   `malloc_trim(3)`.
-2. **dlmalloc KHÔNG dùng `madvise` ở đâu cả** (grep xác nhận 0 kết quả).
-   Cơ chế trả bộ nhớ giữa heap của nó (`release_unused_segments`) chỉ
-   `munmap()` **nguyên một segment mmap riêng biệt** khi segment đó
-   trống hoàn toàn — dựa vào kiến trúc multi-segment (nhiều vùng heap
-   rời rạc) mà project của bạn không có. **Kết luận: học theo glibc's
-   `mtrim`, không theo dlmalloc.**
-3. `sysconf(_SC_PAGESIZE)` trên Linux/glibc **không phải syscall** — chỉ
-   đọc biến toàn cục `GLRO(dl_pagesize)` được cache 1 lần lúc process
-   khởi động (từ `AT_PAGESZ` trong auxv). Gọi nhiều lần không tốn kém.
-4. Công thức round-up/round-down: `round_up = (x + mask) & ~mask`,
-   `round_down = x & ~mask`, với `mask = page_size - 1` (chỉ đúng khi
-   page_size là luỹ thừa 2). Đã đối chiếu 1-1 với `mtrim()` thật: glibc
-   tính theo "trừ dần độ dài" (`size -= offset; size & ~psm1`), code của
-   bạn tính theo "2 con trỏ start/end" — toán học tương đương.
-5. Vì sao `madvise` phải gọi **riêng cho từng chunk trong bin**, không
-   gộp: các chunk trong cùng bin không liền nhau về vật lý (chỉ liền về
-   logic qua `list`), gộp madvise sẽ đụng vào chunk khác đang allocated
-   ở giữa -> corruption.
-6. Invariant "không 2 free chunk liền kề nhau trong heap" được đảm bảo
-   bởi `coalesce()` gọi trước mọi `insert_*` trong `my_free`, và tính
-   bắc cầu của `split()` (không tự coalesce nhưng an toàn vì chỉ cắt bên
-   trong 1 chunk đã từng được coalesce).
-7. `static` (file-scope) + không khai báo trong `.h` = ẩn hoàn toàn khỏi
-   file `.c` khác (che giấu implementation detail, tiền lệ có sẵn:
-   `ensure_state()` trong `debug.c`).
-
-## Thiết kế đã chốt cho tính năng trim
-
-- `trim_chunk(mblockptr *block)` — **private/static**, xử lý 1 chunk,
-  trả về `size_t` byte thực sự đã madvise (khác glibc's boolean `result`
-  — cố ý, để `my_malloc_trim` cộng dồn tổng byte chính xác cho mục đích
-  logging/debug).
-- `my_malloc_trim(void)` — **public API**, duyệt `gm.bins[i]` từ
-  `i = get_bin_bucket(LINUX_PAGE)` trở lên (bỏ qua small bin, không thể
-  chứa trọn 1 page — tương đương `psindex` trong glibc), gọi `trim_chunk`
-  cho từng chunk, cộng dồn, trả tổng.
-- **KHÔNG tự động gọi trong `my_free`** — đúng model glibc (`mtrim` là
-  API riêng, không phải side-effect của free). Top-chunk shrink
-  (`SHRINK_THRESHOLD` trong `my_free`) giữ nguyên, tách biệt, tương
-  đương `systrim` tự động của glibc.
-
-## Bug tìm thấy trong `my-malloc.c` bạn vừa upload — CẦN SỬA TRƯỚC KHI REFACTOR
-
-1. **`get_bin_bucket` bị đổi tên thành `get_bin`** trong `my-malloc.c`,
-   nhưng `debug.c` (dòng trong `check_bins()`) vẫn gọi `get_bin_bucket`,
-   và `my-malloc.h` vẫn khai prototype cũ -> **lỗi linker** khi build
-   bản `DEBUG`. Cần đồng bộ tên ở cả 3 chỗ.
-2. **`insert_small_chunk`/`insert_large_chunk` bị thêm `static`** trong
-   `.c`, nhưng `my-malloc.h` vẫn khai `non-static` -> **lỗi compile**
-   ("static declaration follows non-static declaration"). Ngoài ra
-   `split()` gọi 2 hàm này *trước* điểm định nghĩa trong file -> cần
-   forward-declare nếu giữ static.
-3. **Hàm trim public đặt tên `malloc_trim`** — trùng tên với hàm thật
-   trong libc (`int malloc_trim(size_t)`), khác chữ ký
-   (`size_t malloc_trim(void)`) -> nguy cơ conflicting-types hoặc link
-   nhầm symbol. **Phải đổi thành `my_malloc_trim`.**
-4. Biến `psm1` trong `malloc_trim()`/`trim_chunk` khai báo nhưng không
-   dùng -> warning `unused variable`, nên xoá hoặc dùng làm bộ lọc sớm
-   giống glibc.
-
-## Việc đã xác nhận HOÀN THÀNH từ phiên trước (không cần làm lại)
-
-- `split()` giờ đã gọi `insert_small_chunk`/`insert_large_chunk` thay vì
-  `list_add_after` thô — khớp yêu cầu insert-sorted đã đề ra.
-- Khối dead code sbrk-extend trong `my_realloc`
-  (`if (next_block == gm.heap_end)`) đã bị xoá — không còn thấy trong
-  file hiện tại.
-
-## Kiến trúc refactor đang bàn dở (CHƯA áp dụng vào code thật)
-
-Mục tiêu người dùng: "dự án đẹp, đầy đủ API + hàm test nội bộ".
+Cấu trúc thật đã có (xác nhận qua `my-malloc.h`, `debug.h`, `internal.h`
+mới upload):
 
 ```
-my-malloc/
-├── include/
-│   └── my-malloc.h       <-- CHỈ public API: my_malloc, my_free,
-│                              my_realloc, my_calloc, my_malloc_trim
-├── src/
-│   ├── internal.h         <-- MỚI, chưa tạo: get_bin_bucket,
-│   │                          debug_get_state, struct mblockptr,
-│   │                          malloc_state... debug.c VÀ my-malloc.c
-│   │                          đều include file này thay vì include
-│   │                          lẫn nhau
-│   ├── my-malloc.c
-│   ├── debug.c / debug.h
-│   └── list.h
-├── tests/                 <-- chưa tạo
-│   ├── test_coalesce.c    (test hàm static, dùng #include "../src/my-malloc.c"
-│   │                       hoặc macro STATIC/static để "mở khoá" linkage)
-│   └── test_public_api.c  (black-box, chỉ include my-malloc.h, giống
-│                            triết lý check_heap/check_bins hiện tại)
-└── Makefile                <-- chưa dựng, build lib + build test riêng
+include/
+└── my-malloc.h     <-- CHỈ public API: my_malloc, my_realloc, my_calloc,
+                         my_free, my_malloc_trim. Không còn leak struct/macro
+                         nội bộ ra ngoài.
+src/ (suy ra, chưa thấy lại my-malloc.c/debug.c bản mới)
+├── internal.h      <-- MỚI, đã tạo thật. Chứa: struct mblockptr,
+│                        malloc_state, mọi macro (ALIGN, SET_FREE, IS_FREE,
+│                        BLOCK_NEXT_HEADER...), prototype của các hàm "nội
+│                        bộ nhưng cross-file" — get_bin, split, coalesce,
+│                        try_expand, find_suitable_block, insert_small_chunk,
+│                        insert_large_chunk, trim_chunk, grow_top, heap_init,
+│                        debug_get_state (dưới #ifdef DEBUG). internal.h tự
+│                        include "../include/my-malloc.h".
+├── debug.h         <-- include "internal.h", khai check_heap/check_bins/
+│                        check_top_chunk/check_heap_bin_consistency/
+│                        check_malloced_chunk/check_mmapped_chunk (mới thêm
+│                        so với phiên trước) dưới #ifdef DEBUG, macro no-op
+│                        khi không DEBUG.
+├── my-malloc.c, debug.c, list.h  (nội dung mới chưa được xem lại trong
+    phiên này — cần re-view trước khi sửa gì thêm)
 ```
 
-Quy tắc 3 câu hỏi để quyết định static/public đã chốt:
-1. Hàm có phải "hợp đồng" người dùng thư viện cần gọi? -> `.h` public, không static.
-2. Hàm có bị gọi chéo giữa nhiều file `.c` trong CHÍNH project (không
-   phải người dùng ngoài)? -> khai trong `internal.h`, không static
-   (bắt buộc kỹ thuật, coi như "package-private").
-3. Mặc định -> `static`, không khai ở đâu ngoài file định nghĩa.
+## Quyết định kỹ thuật ĐÃ CHỐT — cách test gọi hàm static/internal
 
-Áp dụng: `coalesce`, `split`, `try_expand`, `find_suitable_block`,
-`insert_small_chunk`, `insert_large_chunk`, `trim_chunk` -> static.
-`get_bin_bucket`, `debug_get_state` -> `internal.h`, không static (vì
-`debug.c` cần gọi).
+Câu hỏi để mở từ phiên trước ("test static functions bằng cách nào") đã
+được cấu trúc mới **tự giải quyết**, không cần macro `STATIC` hay
+`#include "*.c"` trong test file:
 
-## Việc tiếp theo gợi ý (theo thứ tự)
+- Các hàm nội bộ (`coalesce`, `split`, `trim_chunk`, `insert_small_chunk`,
+  `get_bin`, ...) khai trong `internal.h` là **non-static, external
+  linkage**. Test file chỉ cần `#include "internal.h"` + link với
+  `my-malloc.o` đã build là gọi được thẳng.
+- "Private" ở đây là quy ước ẩn qua header visibility, KHÔNG phải static
+  compiler-enforced — giống style glibc (`_int_malloc`, `_int_free` không
+  static, chỉ không có trong public header). Nên có 1 dòng comment ở đầu
+  `internal.h` ghi rõ đây là chủ ý đánh đổi để test được, không phải sơ sót.
+- Test qua public API (`my-malloc.h` only) vẫn dùng được song song, chọn
+  theo từng test file, không phải chọn 1 kiểu duy nhất cho cả project.
+- Hệ quả cho build test: compile `my-malloc.c` + `debug.c` với `-DDEBUG`
+  khi link test binary (để `check_heap()` v.v. là hàm thật, không phải
+  no-op), test build cần `-Iinclude -Isrc`.
 
-1. Sửa 4 bug ở trên trong `my-malloc.c`/`my-malloc.h`/`debug.c` — verify
-   lại bằng cách build thử (chưa có Makefile, có thể cần dựng tạm 1
-   lệnh gcc thủ công để build + link `DEBUG` version trước).
-2. Dựng `internal.h`, tách `include/` vs `src/`, di chuyển
-   `get_bin_bucket`/`debug_get_state` vào đó.
-3. Quyết định kỹ thuật test cho hàm static: `#include` file `.c` thẳng
-   vào file test, hay macro `STATIC`/`static` bật tắt qua
-   `#ifdef UNIT_TEST`. Chưa chốt — đã trình bày trade-off cho người
-   dùng tự chọn, người dùng chưa trả lời.
-4. Dựng `Makefile` build lib + test riêng.
-5. Viết test case cho `trim_chunk` dùng số ví dụ cụ thể đã tính tay
-   trong phiên này (payload=4096, page=4096, kiểm cả case
-   payload_start đã align sẵn lẫn chưa align) để verify công thức
-   round-up/round-down.
+## Trạng thái 4 bug từ phiên trước
+
+1. `get_bin_bucket` -> `get_bin` đồng bộ 3 chỗ — **ĐÃ FIX** (xác nhận ở
+   phiên trước, chưa re-verify trong `internal.h` mới nhưng prototype
+   `int get_bin(size_t payload);` khớp).
+2. `insert_small_chunk`/`insert_large_chunk` static vs non-static mismatch
+   — **ĐÃ FIX** (phiên trước xác nhận non-static, khớp header).
+3. `malloc_trim` trùng tên libc, sai chữ ký — **ĐÃ FIX ở public header**:
+   `my-malloc.h` giờ chỉ khai `size_t my_malloc_trim(void);`, không còn
+   `malloc_trim` cũ. Prototype cũng thấy trong `internal.h`
+   (`trim_chunk`). *Chưa xem lại `my-malloc.c` bản mới* để confirm định
+   nghĩa hàm khớp tên — cần re-view trước khi tin tưởng 100%.
+4. Biến `psm1` khai nhưng không dùng trong `my_malloc_trim`/`trim_chunk`
+   — **CHƯA XÁC NHẬN LẠI**, vì chưa thấy `my-malloc.c` bản mới trong phiên
+   này. Cần view lại file trước khi coi là đã fix hay chưa.
+
+**Việc cần làm đầu phiên sau: xin/`view` lại `my-malloc.c` và `debug.c`
+bản mới nhất để re-verify bug #3 và #4, trước khi bắt đầu viết code test
+thật.**
+
+## Test plan đã thống nhất — 4 lớp
+
+1. **Internal mechanics (white-box, qua `internal.h`)**
+   - `get_bin(payload)`: biên `0`, `SMALL_BIN_MAX - 1`, `SMALL_BIN_MAX`,
+     `2^LARGE_BIN_MIN_EXP`, `2^LARGE_BIN_MAX_EXP`, và giá trị vượt max
+     (phải clamp).
+   - `split()`: payload đúng `request_size + MINBLOCKSIZE - 1` (KHÔNG
+     split) vs đúng `MINBLOCKSIZE` (phải split); kiểm footer của phần dư.
+   - `coalesce()`: 4 case — không neighbor free, prev free, next free, cả
+     hai free; case absorb vào top chunk test riêng.
+   - `trim_chunk()`: bảng test data-driven `{payload, expect_trimmed}`,
+     dùng lại số đã tính tay phiên trước (payload=4096, page=4096), cả
+     case payload_start đã align sẵn lẫn chưa align, và case payload nhỏ
+     hơn 1 page (`expect_trimmed == 0`).
+
+2. **Public API (black-box, chỉ `my-malloc.h`)**
+   - size 0, size khổng lồ (`SIZE_MAX`), round-trip alloc/free/
+     realloc-grow/realloc-shrink, overflow guard của `my_calloc`
+     (`num * size` overflow), double-free (phải abort — chạy qua
+     fork/subprocess để không giết luôn test runner).
+
+3. **Invariant/property test (dùng lại `check_*` làm oracle)** — lớp đòn
+   bẩy cao nhất vì tận dụng code debug đã có sẵn. Chạy chuỗi random
+   `my_malloc`/`my_free`/`my_realloc`, sau mỗi N thao tác gọi
+   `check_heap()`, `check_bins()`, `check_heap_bin_consistency()`,
+   `check_top_chunk()`. Bug ở `coalesce`/bin-insertion sẽ lộ ra dù không
+   có unit test nào target trực tiếp.
+   - Lưu ý performance: `check_heap_bin_consistency()` là O(tổng số free
+     chunk) qua `list_length()` từng bin (list_length tự nó O(n)) — với
+     heap có nhiều free chunk (vd 10k), gọi sau MỌI thao tác trong vòng
+     lặp random sẽ tốn — cân nhắc gọi sau mỗi N thao tác (vd N=50-100)
+     thay vì mỗi thao tác một lần. (Câu hỏi đang để mở cho người dùng tự
+     ước lượng, chưa chốt N cụ thể.)
+
+4. **Regression test** — 1 test cho mỗi bug đã tìm+fix (tên hàm
+   `get_bin`, `my_malloc_trim`, non-static insert_*...), để tránh
+   regress lại.
+
+## Đã học thêm trong phiên này (grounded)
+
+- `check_heap_bin_consistency()`: đây là cross-structure invariant check
+  — so sánh "ground truth" (đếm free chunk bằng cách duyệt vật lý cả
+  heap) với "index" (tổng độ dài tất cả list trong `gm.bins[]`). CHỈ
+  check số lượng khớp, KHÔNG check đúng bin (đó là việc của
+  `check_bins()` qua `get_bin(curr->payload) == i`). Vi phạm invariant
+  này là bug âm thầm (không crash ngay): free_chunk > binned_cnt nghĩa
+  là có free block "vô hình" với allocator (leak logic — không bao giờ
+  được tái sử dụng dù đã free đúng cách); binned_cnt > free_chunk nghĩa
+  là có node trong bin trỏ tới vùng nhớ không còn là free chunk hợp lệ
+  (dangling/corruption, sẽ crash ở lần alloc kế tiếp đụng phải node đó).
+  Các nguyên nhân điển hình: quên `insert_*` sau `SET_FREE`, quên
+  `list_unlink` trước khi merge 2 chunk trong `coalesce`, hoặc `split()`
+  insert cả node gốc lẫn phần dư vào bin.
+
+## Việc tiếp theo (thứ tự đề xuất)
+
+1. `view` lại `my-malloc.c` và `debug.c` bản mới nhất — re-verify bug #3
+   (tên hàm `my_malloc_trim` định nghĩa khớp) và #4 (`psm1` unused, còn
+   tồn tại không).
+2. Quyết định N (tần suất gọi `check_heap_bin_consistency` trong vòng lặp
+   random test) — người dùng chưa trả lời câu hỏi này.
+3. Dựng `tests/` skeleton thật (chưa tồn tại) + `Makefile` target `test`
+   (build `my-malloc.o`/`debug.o` với `-DDEBUG`, link test binary với
+   `-Iinclude -Isrc`).
+4. Viết test layer 1 trước (internal mechanics), bắt đầu từ bảng
+   `trim_chunk` đã có số tính tay sẵn — ít tốn công nhất để có test đầu
+   tiên chạy được, verify được toàn bộ toolchain (build + link + assert)
+   trước khi mở rộng ra layer 2-4.
+5. Sau khi layer 1 chạy ổn, viết layer 3 (property test) tái dùng
+   `check_*` — giá trị cao, code debug đã có sẵn, chỉ cần viết driver
+   random.

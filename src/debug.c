@@ -7,19 +7,31 @@ static const malloc_state *state = NULL;
 static void ensure_state(void)
 {
     if (state == NULL)
-        state = debug_get_state();   // chỉ gọi hàm accessor 1 LẦN, lần đầu tiên cần dùng
+        state = debug_get_state();   
 }
 
+static void check_any_chunk(mblockptr * block) {
+    assert(ok_address(block));
+    assert(is_aligned(block->payload));
+    assert(is_aligned((char *)(block + 1)));  
+}
 
 void check_top_chunk(void)
 {
-    ensure_state();
     assert((char *)(state->topchunkptr + 1) + state->topsize == state->heap_end);
+}
+
+void check_mmapped_chunk(mblockptr* block) {
+    size_t sz = block->payload;
+
+    assert(IS_MMAP(block));
+    assert(sz >= MMAP_THRESHOLD);
+    assert(is_aligned(sz));
+    assert(is_aligned((char*)( block + 1)));
 }
 
 void check_bins(void)
 {
-    ensure_state();
     mblockptr *curr;
 
     for (int i = 0; i < NUM_BINS; i++)
@@ -38,7 +50,6 @@ void check_bins(void)
 
 
 void check_heap(void) {
-    ensure_state();
     mblockptr * curr = (mblockptr *) state->heap_start;
 
     while(curr != (mblockptr*) state->topchunkptr && (char*) curr < state->heap_end)
@@ -60,8 +71,7 @@ void check_heap(void) {
 
 
 void check_heap_bin_consistency(void) {
-    ensure_state();
-
+   
     size_t free_chunk = 0;
     mblockptr * curr = (mblockptr*) state->heap_start;
 
@@ -81,6 +91,8 @@ void check_heap_bin_consistency(void) {
 
     assert(free_chunk == binned_cnt);
 }
+
+
 
 
 void check_malloced_chunk (void* ptr, size_t requested_size) {

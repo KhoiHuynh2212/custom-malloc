@@ -36,7 +36,7 @@ void test_no_shrink_below_threshold(void)
     const malloc_state *s = debug_get_state();
     size_t top_size_before = s->topsize;
     void *heap_end_before = s->heap_end;
-    assert(top_size_before < (size_t)SHRINK_THRESHOLD);
+    assert(top_size_before < (size_t)TRIM_THRESHOLD);
     void *p = my_malloc(16);
     assert(p != NULL);
     my_free(p);
@@ -44,7 +44,7 @@ void test_no_shrink_below_threshold(void)
     assert(s->topsize != TOP_PAD_SIZE);
     assert(s->topsize >= top_size_before);
     printf("test_no_shrink_below_threshold: PASS (topsize=%zu, still below %ld)\n",
-           s->topsize, SHRINK_THRESHOLD);
+           s->topsize, TRIM_THRESHOLD);
 }
 
 void test_shrink_lands_on_pad_size(void)
@@ -54,7 +54,7 @@ void test_shrink_lands_on_pad_size(void)
 
     for (int i = 0; i < 3; i++)
         assert(grow_top(1) != NULL);
-    assert(st->topsize >= (size_t)SHRINK_THRESHOLD);
+    assert(st->topsize >= (size_t)TRIM_THRESHOLD);
 
     void *guard = my_malloc(16);
     assert(guard != NULL);
@@ -65,7 +65,7 @@ void test_shrink_lands_on_pad_size(void)
     assert((char *)(st->topchunkptr + 1) + st->topsize == st->heap_end);
 
     printf("test_no_shrink_below_threshold: PASS (topsize=%zu, still below %ld)\n",
-           st->topsize, SHRINK_THRESHOLD);
+           st->topsize, TRIM_THRESHOLD);
 }
 
 void test_descending_order_bin(void)
